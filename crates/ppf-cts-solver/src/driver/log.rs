@@ -198,6 +198,11 @@ impl Marked {
 /// macro below can expand to it from another module; the emitters in this file,
 /// which already hold a built string, call it directly.
 pub fn message_text(text: &str) {
+    // An embedding host (the C API) can switch the transcript off; see
+    // `crate::QUIET_TRANSCRIPT`. Stream files are written regardless.
+    if crate::QUIET_TRANSCRIPT.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let depth = current_depth();
     let mut line = String::with_capacity(text.len() + 3 * depth);
     // THE OUTERMOST SECTION IS FLUSH LEFT, so the indent is (depth - 1) * 3.

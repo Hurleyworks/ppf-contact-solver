@@ -35,7 +35,9 @@ use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 ///    now returns `PPF_CTS_ERR_NO_CUDA_DEVICE` when the build links no GPU
 ///    backend library (the solve would otherwise run silently on the CPU host
 ///    renderings). Struct layouts are unchanged from 5.
-const ABI_VERSION: u32 = 6;
+/// 7: adds `ppf_cts_set_verbose`. The solver's per-step console transcript is
+///    now OFF by default on the C API path. Struct layouts are unchanged.
+const ABI_VERSION: u32 = 7;
 
 /// Current C ABI version. Callers compare against their compiled header.
 #[no_mangle]
@@ -64,9 +66,30 @@ pub extern "C" fn ppf_cts_backend_name() -> *const c_char {
     .as_ptr()
 }
 
+/// Whether the solver prints its per-step console transcript. Off by default
+/// for the C API: the host owns the console. Process-global, like the solver.
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn apply_verbose() {
+    use std::sync::atomic::Ordering;
+    ppf_cts_solver::QUIET_TRANSCRIPT.store(!VERBOSE.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// Turn the solver's per-step console transcript (`====== advance ======`,
+/// `* time = ...`, newton/phase lines) on (nonzero) or off (0). Default off.
+/// Process-global; may be called at any time, before or after
+/// [`ppf_cts_create`]. Errors are still reported through the status codes and
+/// [`ppf_cts_last_error`], and the CUDA backend's error lines still print.
+#[no_mangle]
+pub extern "C" fn ppf_cts_set_verbose(verbose: i32) {
+    VERBOSE.store(verbose != 0, std::sync::atomic::Ordering::Relaxed);
+    apply_verbose();
+}
+
 /// Allocate a new solver context. Returns null only on allocation panic.
 #[no_mangle]
 pub extern "C" fn ppf_cts_create() -> *mut CtsContext {
+    apply_verbose();
     guard_value(std::ptr::null_mut(), || {
         Box::into_raw(Box::new(CtsContext::new()))
     })

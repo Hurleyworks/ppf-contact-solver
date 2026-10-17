@@ -75,6 +75,14 @@ pub fn linked_backend_name() -> Option<&'static str> {
     }
 }
 
+/// When true, the solver's console transcript (`driver::log::message_text`:
+/// the per-step `====== advance ======`, `* time = ...`, `------ newton step`
+/// lines) is not printed. The `.out` stream files and every warning, error and
+/// panic path are unaffected. The binary never sets it; the C API sets it by
+/// default (`ppf_cts_set_verbose`), since an embedding host owns the console.
+pub static QUIET_TRANSCRIPT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The backend `build.rs` selected (`cuda`, `metal`, `rocm`, `cpu`).
 pub const SELECTED_BACKEND: &str = env!("PPF_BACKEND");
 

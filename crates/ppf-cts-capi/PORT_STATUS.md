@@ -16,6 +16,12 @@ Source: old-ppf-contact-solver a5fdad3. Target base: 6b30976. Nothing committed.
 - crates/ppf-cts-solver: new src/lib.rs (modules made pub), main.rs uses the lib (unused imports removed), backend.rs adds initialize_in_memory/step_in_memory/intersection_count, probe_device and averaged_edge_param made pub.
 - build-win-native: build-capi-local.bat, build-cuda-static-local.bat, scripts/derive_mt_jobs.py.
 
+## ABI 7: quiet console (2026-10-17, uncommitted)
+- All per-step console lines (`====== advance ======`, `* time = ...`, `------ newton step`, `> lbvh_build...`) go through one function, `ppf-cts-solver/src/driver/log.rs` `message_text`. The CUDA backend prints only errors and env-gated stats (stderr).
+- ppf-cts-solver/src/lib.rs: `pub static QUIET_TRANSCRIPT: AtomicBool` (default false, so the binary is unchanged). log.rs `message_text` returns early when it is set. The `.out` stream files, `log::warn!`, `### FATAL`, CUDA error lines and panics are untouched.
+- ppf-cts-capi/src/lib.rs: ABI 7, `ppf_cts_set_verbose(int32_t)`. A capi-side VERBOSE flag (default off) is applied by `ppf_cts_set_verbose` and by `ppf_cts_create`, so the C API path is quiet unless the host asks.
+- Rebuilt with `build-capi-local.bat nocuda` (no CUDA change; the static CUDA lib is unchanged).
+
 ## Notes
 - The solver driver keeps its state in globals (SCENE, SOLVER), so only one live context per process.
 - The capi build passes `--features ppf-cts-solver/cuda` and links libsimbackend_cuda + cudart. For a static plugin, swap cudart.lib for cudart_static.lib and use the build-mt lib dir, as `spike\build.bat static` does.

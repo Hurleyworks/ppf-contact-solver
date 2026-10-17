@@ -183,6 +183,15 @@ const char *ppf_cts_last_error(void);
 const char *ppf_cts_backend_name(void);
 
 /**
+ * Turn the solver's per-step console transcript (`====== advance ======`,
+ * `* time = ...`, newton/phase lines) on (nonzero) or off (0). Default off.
+ * Process-global; may be called at any time, before or after
+ * [`ppf_cts_create`]. Errors are still reported through the status codes and
+ * [`ppf_cts_last_error`], and the CUDA backend's error lines still print.
+ */
+void ppf_cts_set_verbose(int32_t verbose);
+
+/**
  * Allocate a new solver context. Returns null only on allocation panic.
  */
 struct CtsContext *ppf_cts_create(void);
