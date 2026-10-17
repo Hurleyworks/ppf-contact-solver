@@ -301,6 +301,49 @@ enum CtsStatus ppf_cts_set_collider_ex(struct CtsContext *ctx,
                                        const uint32_t *face_material_idx);
 
 /**
+ * Add one ANIMATED collider body (call once per body, before
+ * [`ppf_cts_initialize`]; any order relative to the other staging calls).
+ * Static colliders still go through [`ppf_cts_set_collider_ex`].
+ *
+ * - `local_vertices`: `3*vertex_count` floats, the body's mesh in its own
+ *   local space.
+ * - `faces`: `3*face_count` triangle indices into `local_vertices`.
+ * - Keyframes, `key_count >= 1`: `key_times` (seconds of sim time, strictly
+ *   ascending; sim time 0 is the state staged by `set_geometry`),
+ *   `key_translations` (3 per key), `key_rotations` (4 per key, quaternion
+ *   in `w, x, y, z` order, normalized here), `key_scales` (3 per key).
+ *   World position = `R(q) * (S .* local) + T`; translation/scale
+ *   interpolate linearly, rotation by slerp; the pose holds before the first
+ *   and after the last key.
+ * - `material`: contact gap (> 0) and friction of the body's surface.
+ *
+ * Internally this is the Python frontend's animated-static "pin shell": a
+ * shell with density, Young's modulus, Poisson's ratio and bend all 0,
+ * flagged as a STATIC collider (no self-contact, no contact with other
+ * colliders, no bending), every vertex an exact kinematic pin driven by the
+ * keyframes, evaluated at each step's end time.
+ *
+ * Vertex indexing: the shell vertices are inserted right after the
+ * caller's contact (surface) vertices, before any tet-interior vertex, and
+ * shell faces right after the caller's shell faces. Every index the caller
+ * stages (faces, rods, pins, PDRD) is in the caller's own numbering and is
+ * remapped internally; the caller's contact vertices keep their indices, so
+ * [`ppf_cts_surface_vertex_count`] / [`ppf_cts_read_positions`] report
+ * exactly the caller's contact vertices and never the collider shells.
+ */
+enum CtsStatus ppf_cts_add_animated_collider(struct CtsContext *ctx,
+                                             const float *local_vertices,
+                                             uint32_t vertex_count,
+                                             const uint32_t *faces,
+                                             uint32_t face_count,
+                                             const double *key_times,
+                                             const double *key_translations,
+                                             const double *key_rotations,
+                                             const double *key_scales,
+                                             uint32_t key_count,
+                                             const struct CtsColliderMaterial *material);
+
+/**
  * Mark pinnable vertices once. `stiffness` may be null (per-pin force
  * scale defaults to 1.0); otherwise it must hold `count` floats.
  */
@@ -311,7 +354,14 @@ enum CtsStatus ppf_cts_set_pins(struct CtsContext *ctx,
 
 /**
  * Push per-frame pin target positions (`3*count` floats), aligned with
- * the `set_pins` index order.
+ * the `set_pins` index order. Pins are exact (Dirichlet) constraints.
+ *
+ * After [`ppf_cts_initialize`] the targets are for the NEXT frame boundary
+ * (the next multiple of `1/fps`, `fps` from [`ppf_cts_set_params`]): each
+ * pin moves linearly in sim time from where it is now to its target over
+ * the steps up to that boundary, then holds. Call it once per frame, before
+ * stepping that frame. Before initialize the targets apply at once (the
+ * pins' starting pose).
  */
 enum CtsStatus ppf_cts_update_pin_targets(struct CtsContext *ctx,
                                           const float *positions,
@@ -373,14 +423,18 @@ enum CtsStatus ppf_cts_step(struct CtsContext *ctx, double *out_sim_time);
 
 /**
  * Copy current surface vertex positions into `out` (`3*vertex_count`
- * floats). `vertex_count` must be at least `surface_vertex_count`.
+ * floats). `vertex_count` must be at least `surface_vertex_count`. These are
+ * the caller's contact vertices `0..surface_vertex_count` in the caller's
+ * numbering; animated collider shells are never included.
  */
 enum CtsStatus ppf_cts_read_positions(const struct CtsContext *ctx,
                                       float *out,
                                       uint32_t vertex_count);
 
 /**
- * Number of surface vertices (the count `read_positions` writes).
+ * Number of surface vertices (the count `read_positions` writes): the
+ * caller's staged vertices minus tet-interior ones, excluding animated
+ * collider shells.
  */
 uint32_t ppf_cts_surface_vertex_count(const struct CtsContext *ctx);
 

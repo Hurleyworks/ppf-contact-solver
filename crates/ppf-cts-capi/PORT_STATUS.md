@@ -22,6 +22,13 @@ Source: old-ppf-contact-solver a5fdad3. Target base: 6b30976. Nothing committed.
 - ppf-cts-capi/src/lib.rs: ABI 7, `ppf_cts_set_verbose(int32_t)`. A capi-side VERBOSE flag (default off) is applied by `ppf_cts_set_verbose` and by `ppf_cts_create`, so the C API path is quiet unless the host asks.
 - Rebuilt with `build-capi-local.bat nocuda` (no CUDA change; the static CUDA lib is unchanged).
 
+## ABI 8: animated colliders (2026-10-17, uncommitted)
+- `ppf_cts_add_animated_collider(ctx, local_vertices, vertex_count, faces, face_count, key_times, key_translations, key_rotations, key_scales, key_count, material)`: one keyframed collider body (times in sim seconds, T/S linear, rotation `w,x,y,z` slerp; double arrays). Built like the frontend's `_setup_pin_shell`: a shell with density/Young/Poisson/bend 0, `collider_vertex_mask` set on its verts (FaceProp.collider via builder.rs), every vertex an exact kinematic FixPair posed by `ppf_cts_core::datamodel::quat::transform_keyframes_step` (the same evaluator as `PinOperation::TransformKeyframes`) at `state.time + dt`, with `step_delta` from the pose at `state.time`.
+- context.rs: `set_geometry_ex` now stages raw arrays; the MeshSet is built at `initialize` after `ingest::insert_shells` splices the shells in after the caller's contact verts (before tet-interior verts) and after the caller's shell faces. Caller indices (pins, tets, PDRD) are remapped; `surface_vertex_count`/`read_positions` stay the caller's contact verts (shells excluded).
+- `update_pin_targets` after initialize: pins blend linearly in sim time from their current position to the new target, reached at the next 1/fps boundary (was: whole frame delta on the first step). `step_delta` = pose(t+dt) - pose(t). Before initialize targets still apply at once. `pin_step_start` removed.
+- Static collider path (`set_collider_ex`) unchanged. No CUDA change; rebuilt with `build-capi-local.bat nocuda`.
+- Tests (CPU, `cargo test -p ppf-cts-capi --features ppf-cts-solver/cpu`): insert_shells layout, keyframed pose, bad keys, pin blend.
+
 ## Notes
 - The solver driver keeps its state in globals (SCENE, SOLVER), so only one live context per process.
 - The capi build passes `--features ppf-cts-solver/cuda` and links libsimbackend_cuda + cudart. For a static plugin, swap cudart.lib for cudart_static.lib and use the build-mt lib dir, as `spike\build.bat static` does.

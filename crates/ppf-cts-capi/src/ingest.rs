@@ -44,6 +44,7 @@ pub fn build_meshset(
     tets: &[u32],
     rods: &[u32],
     shell_face_count: usize,
+    collider_vertex_mask: Vec<u8>,
 ) -> MeshSet {
     let vertex = Matrix3xX::<f32>::from_column_slice(verts);
 
@@ -74,9 +75,11 @@ pub fn build_meshset(
         rest_vertex: None,
         bend_rest_vertex: None,
         bend_rest_vertex_mask: Vec::new(),
-        // The collider is passed as the constraint's CollisionMesh, not as a
-        // STATIC object in the solved namespace, so no vertex is a collider.
-        collider_vertex_mask: Vec::new(),
+        // A static collider is passed as the constraint's CollisionMesh, not
+        // as a STATIC object in the solved namespace. Animated colliders are
+        // pin shells in the solved namespace and flag their vertices here
+        // (empty when there are none).
+        collider_vertex_mask,
         // One object, one group, default intersection policy (allow
         // nothing), no pre-existing intersections linked.
         object_vertex_index: Vec::new(),
@@ -84,6 +87,142 @@ pub fn build_meshset(
         intersect_policy: Vec::new(),
         start_link: Vec::new(),
     }
+}
+
+/// One animated-collider shell to splice into the solved geometry: its
+/// world-space vertices at sim time 0 (`3*n` floats), its triangles in local
+/// indices (0..n), and the material row its faces use.
+pub struct ShellInsert<'a> {
+    pub verts: &'a [f32],
+    pub faces: &'a [u32],
+    pub material_row: u32,
+}
+
+/// The staged geometry after splicing animated-collider shells in.
+pub struct MergedGeometry {
+    pub verts: Vec<f32>,
+    pub faces: Vec<u32>,
+    pub tets: Vec<u32>,
+    pub rods: Vec<u32>,
+    pub shell_face_count: usize,
+    /// Per-face material row, `None` when the caller staged none and no shell
+    /// was spliced in (the uniform row-0 path stays byte-identical).
+    pub face_mat_idx: Option<Vec<u32>>,
+    /// Where the shells start: the caller's contact (surface) vertex count.
+    /// Caller vertex `i` keeps index `i` below this and moves to
+    /// `i + shell_vertex_count` at or above it (tet-interior verts only).
+    pub insert: usize,
+    pub shell_vertex_count: usize,
+    /// Global index of each shell's first vertex.
+    pub shell_first: Vec<usize>,
+    /// Per-vertex STATIC-collider flag (1 on shell verts); empty without shells.
+    pub collider_vertex_mask: Vec<u8>,
+}
+
+impl MergedGeometry {
+    /// New index of a caller vertex index.
+    pub fn remap(&self, i: u32) -> u32 {
+        if (i as usize) >= self.insert {
+            i + self.shell_vertex_count as u32
+        } else {
+            i
+        }
+    }
+}
+
+/// Vertices referenced by tets but by no face or rod: the solver orders these
+/// last (`mesh.rs` `count_interior_verts`), so contact vertices are
+/// `0..vertex_count - this`.
+fn count_interior_verts(faces: &[u32], tets: &[u32], rods: &[u32]) -> usize {
+    if tets.is_empty() {
+        return 0;
+    }
+    let surface: std::collections::HashSet<u32> = faces.iter().chain(rods.iter()).copied().collect();
+    let interior: std::collections::HashSet<u32> =
+        tets.iter().copied().filter(|i| !surface.contains(i)).collect();
+    interior.len()
+}
+
+/// Splice animated-collider shells into the caller's geometry, the way the
+/// Python frontend adds a pin shell (`_setup_pin_shell`) as one more SHELL
+/// object. Shell vertices go right after the caller's contact vertices (before
+/// any tet-interior vertex, which the solver requires to come last), and shell
+/// faces right after the caller's shell faces (before its solid contact-only
+/// faces, which must trail `shell_face_count`). The caller's contact vertices
+/// therefore keep their indices, so `read_positions` still returns exactly
+/// them. With no shells the geometry passes through unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_shells(
+    verts: &[f32],
+    faces: &[u32],
+    tets: &[u32],
+    rods: &[u32],
+    shell_face_count: usize,
+    face_mat_idx: Option<&[u32]>,
+    shells: &[ShellInsert],
+) -> MergedGeometry {
+    let n_vert = verts.len() / 3;
+    let insert = n_vert - count_interior_verts(faces, tets, rods).min(n_vert);
+    let shell_vertex_count: usize = shells.iter().map(|s| s.verts.len() / 3).sum();
+    let mut merged = MergedGeometry {
+        verts: Vec::new(),
+        faces: Vec::new(),
+        tets: Vec::new(),
+        rods: Vec::new(),
+        shell_face_count: shell_face_count.min(faces.len() / 3),
+        face_mat_idx: face_mat_idx.map(|a| a.to_vec()),
+        insert,
+        shell_vertex_count,
+        shell_first: Vec::new(),
+        collider_vertex_mask: Vec::new(),
+    };
+    if shells.is_empty() {
+        merged.verts = verts.to_vec();
+        merged.faces = faces.to_vec();
+        merged.tets = tets.to_vec();
+        merged.rods = rods.to_vec();
+        return merged;
+    }
+
+    let mut shell_verts = Vec::with_capacity(3 * shell_vertex_count);
+    let mut shell_faces = Vec::new();
+    let mut shell_face_mat = Vec::new();
+    for s in shells {
+        let first = insert + shell_verts.len() / 3;
+        merged.shell_first.push(first);
+        shell_verts.extend_from_slice(s.verts);
+        shell_faces.extend(s.faces.iter().map(|&f| f + first as u32));
+        shell_face_mat.extend(std::iter::repeat(s.material_row).take(s.faces.len() / 3));
+    }
+
+    merged.verts.extend_from_slice(&verts[..3 * insert]);
+    merged.verts.extend_from_slice(&shell_verts);
+    merged.verts.extend_from_slice(&verts[3 * insert..]);
+
+    let split = 3 * merged.shell_face_count;
+    let remapped = |a: &[u32]| -> Vec<u32> { a.iter().map(|&i| merged.remap(i)).collect() };
+    let mut new_faces = remapped(&faces[..split]);
+    new_faces.extend_from_slice(&shell_faces);
+    new_faces.extend(remapped(&faces[split..]));
+    let new_tets = remapped(tets);
+    let new_rods = remapped(rods);
+
+    let face_count = faces.len() / 3;
+    let user_mat = face_mat_idx.map_or_else(|| vec![0u32; face_count], |a| a.to_vec());
+    let mut mat = user_mat[..merged.shell_face_count].to_vec();
+    mat.extend_from_slice(&shell_face_mat);
+    mat.extend_from_slice(&user_mat[merged.shell_face_count..]);
+
+    let mut mask = vec![0u8; n_vert + shell_vertex_count];
+    mask[insert..insert + shell_vertex_count].fill(1);
+
+    merged.faces = new_faces;
+    merged.tets = new_tets;
+    merged.rods = new_rods;
+    merged.shell_face_count += shell_faces.len() / 3;
+    merged.face_mat_idx = Some(mat);
+    merged.collider_vertex_mask = mask;
+    merged
 }
 
 fn dedup<K>(map: &mut HashMap<K, u32>, store: &mut Vec<K>, key: K) -> u32
@@ -358,4 +497,46 @@ pub fn build_collider(
         .collect();
 
     (vertex, face, face_props, face_params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shells_go_after_contact_verts_and_shell_faces() {
+        // Caller: a cloth triangle (0,1,2) as a shell face, plus a tet
+        // (0,1,2,3) whose vertex 3 is interior, and a solid contact face.
+        let verts = [0.0f32; 12];
+        let faces = [0, 1, 2, 2, 1, 0];
+        let tets = [0, 1, 2, 3];
+        let shell_verts = [1.0f32; 9];
+        let shell_faces = [0, 1, 2];
+        let shells = [ShellInsert { verts: &shell_verts, faces: &shell_faces, material_row: 4 }];
+        let m = insert_shells(&verts, &faces, &tets, &[], 1, None, &shells);
+        assert_eq!(m.insert, 3);
+        assert_eq!(m.shell_first, vec![3]);
+        assert_eq!(m.verts.len(), 3 * 7);
+        assert_eq!(&m.verts[9..18], &shell_verts);
+        // Cloth shell face, collider shell face, then the solid face.
+        assert_eq!(m.faces, vec![0, 1, 2, 3, 4, 5, 2, 1, 0]);
+        assert_eq!(m.shell_face_count, 2);
+        // The interior tet vertex moves past the shell.
+        assert_eq!(m.tets, vec![0, 1, 2, 6]);
+        assert_eq!(m.face_mat_idx, Some(vec![0, 4, 0]));
+        assert_eq!(m.collider_vertex_mask, vec![0, 0, 0, 1, 1, 1, 0]);
+        assert_eq!(m.remap(2), 2);
+        assert_eq!(m.remap(3), 6);
+    }
+
+    #[test]
+    fn no_shells_pass_through() {
+        let verts = [0.0f32; 9];
+        let faces = [0, 1, 2];
+        let m = insert_shells(&verts, &faces, &[], &[], 1, None, &[]);
+        assert_eq!(m.faces, faces.to_vec());
+        assert!(m.face_mat_idx.is_none());
+        assert!(m.collider_vertex_mask.is_empty());
+        assert_eq!(m.insert, 3);
+    }
 }

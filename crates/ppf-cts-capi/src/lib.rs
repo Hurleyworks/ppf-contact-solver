@@ -37,7 +37,11 @@ use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 ///    renderings). Struct layouts are unchanged from 5.
 /// 7: adds `ppf_cts_set_verbose`. The solver's per-step console transcript is
 ///    now OFF by default on the C API path. Struct layouts are unchanged.
-const ABI_VERSION: u32 = 7;
+/// 8: adds `ppf_cts_add_animated_collider` (keyframed collider as a pin
+///    shell). `ppf_cts_update_pin_targets` after initialize now moves each pin
+///    linearly over the steps up to the next frame boundary instead of
+///    jumping on the first step. Struct layouts are unchanged.
+const ABI_VERSION: u32 = 8;
 
 /// Current C ABI version. Callers compare against their compiled header.
 #[no_mangle]
@@ -345,6 +349,76 @@ pub extern "C" fn ppf_cts_set_collider_ex(
     })
 }
 
+/// Add one ANIMATED collider body (call once per body, before
+/// [`ppf_cts_initialize`]; any order relative to the other staging calls).
+/// Static colliders still go through [`ppf_cts_set_collider_ex`].
+///
+/// - `local_vertices`: `3*vertex_count` floats, the body's mesh in its own
+///   local space.
+/// - `faces`: `3*face_count` triangle indices into `local_vertices`.
+/// - Keyframes, `key_count >= 1`: `key_times` (seconds of sim time, strictly
+///   ascending; sim time 0 is the state staged by `set_geometry`),
+///   `key_translations` (3 per key), `key_rotations` (4 per key, quaternion
+///   in `w, x, y, z` order, normalized here), `key_scales` (3 per key).
+///   World position = `R(q) * (S .* local) + T`; translation/scale
+///   interpolate linearly, rotation by slerp; the pose holds before the first
+///   and after the last key.
+/// - `material`: contact gap (> 0) and friction of the body's surface.
+///
+/// Internally this is the Python frontend's animated-static "pin shell": a
+/// shell with density, Young's modulus, Poisson's ratio and bend all 0,
+/// flagged as a STATIC collider (no self-contact, no contact with other
+/// colliders, no bending), every vertex an exact kinematic pin driven by the
+/// keyframes, evaluated at each step's end time.
+///
+/// Vertex indexing: the shell vertices are inserted right after the
+/// caller's contact (surface) vertices, before any tet-interior vertex, and
+/// shell faces right after the caller's shell faces. Every index the caller
+/// stages (faces, rods, pins, PDRD) is in the caller's own numbering and is
+/// remapped internally; the caller's contact vertices keep their indices, so
+/// [`ppf_cts_surface_vertex_count`] / [`ppf_cts_read_positions`] report
+/// exactly the caller's contact vertices and never the collider shells.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn ppf_cts_add_animated_collider(
+    ctx: *mut CtsContext,
+    local_vertices: *const f32,
+    vertex_count: u32,
+    faces: *const u32,
+    face_count: u32,
+    key_times: *const f64,
+    key_translations: *const f64,
+    key_rotations: *const f64,
+    key_scales: *const f64,
+    key_count: u32,
+    material: *const CtsColliderMaterial,
+) -> CtsStatus {
+    guard(|| {
+        let (Some(ctx), Some(material)) = (unsafe { ctx.as_mut() }, unsafe { material.as_ref() })
+        else {
+            return CtsStatus::Null;
+        };
+        if local_vertices.is_null()
+            || faces.is_null()
+            || key_times.is_null()
+            || key_translations.is_null()
+            || key_rotations.is_null()
+            || key_scales.is_null()
+        {
+            error::set_last_error("add_animated_collider: null array");
+            return CtsStatus::BadArg;
+        }
+        let n_key = key_count as usize;
+        let verts = unsafe { slice_f32(local_vertices, 3 * vertex_count as usize) };
+        let faces = unsafe { slice_u32(faces, 3 * face_count as usize) };
+        let times = unsafe { slice_f64(key_times, n_key) };
+        let translations = unsafe { slice_f64(key_translations, 3 * n_key) };
+        let rotations = unsafe { slice_f64(key_rotations, 4 * n_key) };
+        let scales = unsafe { slice_f64(key_scales, 3 * n_key) };
+        ctx.add_animated_collider(verts, faces, times, translations, rotations, scales, *material)
+    })
+}
+
 /// Mark pinnable vertices once. `stiffness` may be null (per-pin force
 /// scale defaults to 1.0); otherwise it must hold `count` floats.
 #[no_mangle]
@@ -373,7 +447,14 @@ pub extern "C" fn ppf_cts_set_pins(
 }
 
 /// Push per-frame pin target positions (`3*count` floats), aligned with
-/// the `set_pins` index order.
+/// the `set_pins` index order. Pins are exact (Dirichlet) constraints.
+///
+/// After [`ppf_cts_initialize`] the targets are for the NEXT frame boundary
+/// (the next multiple of `1/fps`, `fps` from [`ppf_cts_set_params`]): each
+/// pin moves linearly in sim time from where it is now to its target over
+/// the steps up to that boundary, then holds. Call it once per frame, before
+/// stepping that frame. Before initialize the targets apply at once (the
+/// pins' starting pose).
 #[no_mangle]
 pub extern "C" fn ppf_cts_update_pin_targets(
     ctx: *mut CtsContext,
@@ -482,7 +563,9 @@ pub extern "C" fn ppf_cts_step(ctx: *mut CtsContext, out_sim_time: *mut f64) -> 
 }
 
 /// Copy current surface vertex positions into `out` (`3*vertex_count`
-/// floats). `vertex_count` must be at least `surface_vertex_count`.
+/// floats). `vertex_count` must be at least `surface_vertex_count`. These are
+/// the caller's contact vertices `0..surface_vertex_count` in the caller's
+/// numbering; animated collider shells are never included.
 #[no_mangle]
 pub extern "C" fn ppf_cts_read_positions(
     ctx: *const CtsContext,
@@ -502,7 +585,9 @@ pub extern "C" fn ppf_cts_read_positions(
     })
 }
 
-/// Number of surface vertices (the count `read_positions` writes).
+/// Number of surface vertices (the count `read_positions` writes): the
+/// caller's staged vertices minus tet-interior ones, excluding animated
+/// collider shells.
 #[no_mangle]
 pub extern "C" fn ppf_cts_surface_vertex_count(ctx: *const CtsContext) -> u32 {
     guard_value(0, || match unsafe { ctx.as_ref() } {
@@ -539,6 +624,14 @@ unsafe fn slice_f32_mut<'a>(ptr: *mut f32, len: usize) -> &'a mut [f32] {
         &mut []
     } else {
         std::slice::from_raw_parts_mut(ptr, len)
+    }
+}
+
+unsafe fn slice_f64<'a>(ptr: *const f64, len: usize) -> &'a [f64] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr, len)
     }
 }
 
