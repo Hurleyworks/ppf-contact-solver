@@ -1,0 +1,34 @@
+# File: crates/ppf-cts-capi/Cargo.toml
+# Code: Claude Code
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: Apache v2.0
+#
+# C-ABI embedding of the CUDA contact solver. Produces a `staticlib`
+# (`ppf_cts_capi.lib` on Windows) that carries the Rust driver plus
+# *unresolved* references to the C++/CUDA backend symbols. CUDA linkage
+# is deferred to the final link of the host (the LightWave plugin, or the
+# Phase-0 console spike), which adds `libsimbackend_cuda.lib` + `cudart.lib`
+# alongside this crate's `.lib`. See DESIGN.md for the full surface.
+
+[package]
+name = "ppf-cts-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# -> ppf_cts_capi.lib (Windows), libppf_cts_capi.a (Unix).
+crate-type = ["staticlib"]
+
+[dependencies]
+ppf-cts-solver = { path = "../ppf-cts-solver" }
+ppf-cts-core = { path = "../ppf-cts-core" }
+nalgebra.workspace = true
+libc = "0.2"
+
+[build-dependencies]
+# Generates include/ppf_cts.h from the #[no_mangle] surface.
+cbindgen = "0.27"
+
+[lints]
+workspace = true

@@ -3,69 +3,35 @@
 // Review: Ryoichi Ando (ryoichi.ando@zozo.com)
 // License: Apache v2.0
 
-mod args;
-mod backend;
-mod builder;
-mod cosserat;
-// The neutral driver: the Newton loop, the linear solve, the assembly order and
-// every dispatch decision, written once and driven through the `Device` seam.
-// It defines the `extern "C"` surface the unconditional declarations in
-// `backend.rs`, `main.rs` and `status_writer.rs` bind to, so not one call site
-// moves when it is the thing running.
-//
-// The gate names no backend, which is what rule (1d) asks of every name in this
-// crate. What it names is the fact that decides the question: whether this
-// build links an implementation of the seam for the driver to drive. `build.rs`
-// answers that in `Backend::links_neutral_driver`, in the one file that is
-// allowed to know a target's name at all, and the reason a C++ backend answers
-// no is written there rather than here.
+// The driver modules live in the library half of this package (lib.rs) so
+// the LightWave embedding (`ppf-cts-capi`) can link them; this binary uses
+// them from there.
 #[cfg(neutral_driver)]
-mod driver;
-mod cvec;
-mod cvecvec;
-mod data;
-mod force_field;
-mod mesh;
-mod plastic_state;
-mod raw_vec;
-mod scene;
-#[cfg(unix)]
-mod signal_sidecar;
-mod statistics;
-mod status_writer;
-mod triutils;
+use ppf_cts_solver::driver;
+use ppf_cts_solver::{
+    args, backend, builder, data, plastic_state, read, read_gz, scene,
+    status_writer, triutils,
+};
 
-use args::{ProgramArgs, SimArgs};
-use backend::MeshSet;
+use args::ProgramArgs;
 use clap::Parser;
-use data::{DataSet, EdgeParam, EdgeProp, ParamSet};
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use data::{DataSet, EdgeParam, EdgeProp};
 use log::*;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Config, Root};
 use log4rs::encode::pattern::PatternEncoder;
-use mesh::Mesh as SimMesh;
 use rayon::prelude::*;
 use scene::Scene;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::raw::c_char;
-use {builder::Props, cvec::CVec};
 
 extern crate nalgebra as na;
 
 extern "C" {
     fn set_log_path(data_dir: *const c_char);
-}
-
-#[no_mangle]
-extern "C" fn print_rust(message: *const libc::c_char) {
-    let message = unsafe { std::ffi::CStr::from_ptr(message) }
-        .to_str()
-        .unwrap();
-    info!("{message}");
 }
 
 /// The exit status of `--probe` when this build has no usable device here. Not
@@ -429,35 +395,6 @@ fn main() {
     }
 }
 
-fn remove_old_files(dirpath: &str, prefix: &str, suffix: &str, keep_number: i32, max_frame: i32) {
-    if keep_number <= 0 {
-        return;
-    }
-
-    let mut n = 0;
-    for i in 0..=max_frame {
-        let path = format!("{dirpath}/{prefix}{i}{suffix}");
-        if std::path::Path::new(&path).exists() {
-            n += 1;
-        }
-    }
-
-    let mut i = 0;
-    while n > keep_number {
-        let filename = format!("{prefix}{i}{suffix}");
-        let path = format!("{dirpath}/{filename}");
-        if std::path::Path::new(&path).exists() {
-            info!("Removing {filename}...");
-            std::fs::remove_file(path).unwrap_or(());
-            n -= 1;
-        }
-        i += 1;
-        if i > max_frame {
-            break;
-        }
-    }
-}
-
 fn remove_files(dirpath: &str, base: &str, ext: &str, load: i32) {
     let mut count = load + 1;
     loop {
@@ -714,69 +651,8 @@ fn setup(program_args: &ProgramArgs) {
     }
 }
 
-fn decompress_from_gz(compressed_data: Vec<u8>, path: &str) -> Vec<u8> {
-    let mut decoder = GzDecoder::new(compressed_data.as_slice());
-    let mut decompressed_data = Vec::new();
-    if let Err(e) = decoder.read_to_end(&mut decompressed_data) {
-        panic!(
-            "Failed to decompress '{path}': {e}. The file is likely truncated \
-             or corrupt, for example an auto-save that was interrupted or an \
-             incomplete file transfer. Resuming from this checkpoint is not \
-             possible; re-run the simulation or resume from a valid checkpoint."
-        );
-    }
-    decompressed_data
-}
-
-/// 64 KiB I/O write buffer.
-const IO_BUF_CAPACITY: usize = 64 * 1024;
-
-/// Streams serialization directly to a gzip-compressed file without buffering entire data in RAM.
-///
-/// The bytes are written to a temporary sibling file and then atomically
-/// renamed into `path`. A process killed mid-write (e.g. an interrupted
-/// auto-save) therefore leaves either the previous valid file or the fully
-/// written new one, never a truncated gzip that fails to decompress on resume
-/// with `UnexpectedEof`. The temp file is fsynced before the rename so a crash
-/// right after the rename cannot expose partially flushed contents.
-fn save<T: serde::Serialize>(obj: &T, path: &str) {
-    let tmp_path = format!("{}.tmp.{}", path, std::process::id());
-    {
-        let file = std::fs::File::create(&tmp_path).unwrap();
-        let buf_writer = std::io::BufWriter::with_capacity(IO_BUF_CAPACITY, file);
-        let mut encoder = GzEncoder::new(buf_writer, Compression::default());
-        bincode::serialize_into(&mut encoder, obj).unwrap();
-        let buf_writer = encoder.finish().unwrap();
-        let file = buf_writer.into_inner().unwrap();
-        file.sync_all().unwrap();
-    }
-    std::fs::rename(&tmp_path, path).unwrap();
-}
-
-fn read_gz(path: &str) -> Vec<u8> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read '{path}': {e}"));
-    decompress_from_gz(bytes, path)
-}
-
-fn read<'de, T: serde::Deserialize<'de>>(data: &'de [u8]) -> T {
-    // bincode is POSITIONAL: it records no field names and honors no
-    // `serde(default)`, so a checkpoint written by a build whose structs have
-    // since gained a field cannot be read back, and the failure arrives here
-    // as an opaque complaint about trailing bytes or an implausible length.
-    // Name the likely cause instead. The dataset is write-once per session
-    // (see the checkpoint layout notes), so there is no self-healing path and
-    // the answer is always to rebuild the scene rather than to retry.
-    let type_name = std::any::type_name::<T>();
-    bincode::deserialize(data).unwrap_or_else(|e| {
-        panic!(
-            "Failed to deserialize a checkpoint of type {type_name}: {e}.\n\
-             This usually means it was written by a build with a different \
-             in-memory layout for {type_name}, which bincode cannot migrate. \
-             Rebuild the scene to produce a fresh session directory; an \
-             existing dataset.bin.gz cannot be upgraded in place."
-        )
-    })
-}
+#[cfg(test)]
+use ppf_cts_solver::save;
 
 #[cfg(test)]
 mod tests {

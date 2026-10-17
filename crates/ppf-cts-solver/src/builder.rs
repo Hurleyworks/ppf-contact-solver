@@ -2570,7 +2570,7 @@ pub(crate) fn averaged_hinge_param(
     (param, area_sum, all_fixed, all_collider, from_geometry)
 }
 
-pub(crate) fn averaged_edge_param(
+pub fn averaged_edge_param(
     neighbor_faces: &[usize],
     face_props: &[FaceProp],
     face_params: &[FaceParam],

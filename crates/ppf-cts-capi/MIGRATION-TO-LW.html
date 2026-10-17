@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<!--
+  File: crates/ppf-cts-capi/MIGRATION-TO-LW.html
+  Code: Claude Code
+  Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+  License: Apache v2.0
+
+  Migration plan: embed ppf-cts-capi (ZOZO CUDA contact solver, C ABI) into
+  the LightWave repo at E:\lw, starting with a console sandbox app.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ppf-contact-solver &rarr; LightWave Migration Plan</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --ink: #e6e9ef; --muted: #9aa3b2;
+    --line: #262b36; --accent: #5aa9ff; --good: #4ec9a3; --warn: #e0a93b;
+    --bad: #e06c6c; --code: #11141a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 40px 28px 96px; }
+  header.title { border-bottom: 1px solid var(--line); padding-bottom: 22px; margin-bottom: 30px; }
+  h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h2 {
+    font-size: 20px; margin: 42px 0 14px; padding-top: 18px;
+    border-top: 1px solid var(--line); letter-spacing: -0.01em;
+  }
+  h3 { font-size: 16px; margin: 26px 0 10px; color: var(--accent); }
+  p, li { color: var(--ink); }
+  .sub { color: var(--muted); font-size: 14px; }
+  .pill {
+    display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; padding: 3px 9px; border-radius: 999px; vertical-align: middle;
+  }
+  .pill.ok   { background: rgba(78,201,163,.15); color: var(--good); }
+  .pill.todo { background: rgba(90,169,255,.15); color: var(--accent); }
+  .pill.risk { background: rgba(224,108,108,.15); color: var(--bad); }
+  code, pre { font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace; }
+  code { background: var(--code); padding: 1px 6px; border-radius: 5px; font-size: 13px; color: #d7e0ee; }
+  pre {
+    background: var(--code); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; font-size: 13px; line-height: 1.55; margin: 14px 0;
+  }
+  pre .c { color: #6b7587; } pre .k { color: #5aa9ff; } pre .s { color: #4ec9a3; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 22px; margin: 16px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+  ul.check { list-style: none; padding-left: 0; }
+  ul.check li { padding-left: 28px; position: relative; margin: 7px 0; }
+  ul.check li::before { content: "\2610"; position: absolute; left: 0; color: var(--muted); font-size: 17px; }
+  ul.check li.done::before { content: "\2611"; color: var(--good); }
+  .lede { font-size: 16px; color: var(--muted); }
+  .num { color: var(--accent); font-weight: 700; }
+  .callout { border-left: 3px solid var(--warn); background: rgba(224,169,59,.07); padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 14px 0; }
+  .callout.bad { border-left-color: var(--bad); background: rgba(224,108,108,.07); }
+  .callout.good { border-left-color: var(--good); background: rgba(78,201,163,.07); }
+  .small { font-size: 13px; color: var(--muted); }
+  footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="title">
+  <h1>ppf-contact-solver &rarr; LightWave Migration Plan</h1>
+  <p class="sub">Embedding the ZOZO CUDA contact solver (<code>ppf-cts-capi</code> C ABI) into the LightWave workspace at <code>E:\lw</code>.<br>
+  Strategy: prove the integration in a <strong>console sandbox app</strong> first, then promote to a LightWave <code>.p</code> plugin.</p>
+  <p class="small">Source repo: <code>E:\code\open_source\forks\ppf-contact-solver</code> &nbsp;&bull;&nbsp; Target repo: <code>E:\lw</code> &nbsp;&bull;&nbsp; Date: 2026-06-16</p>
+</header>
+
+<!-- ============================================================ -->
+<h2>1. Goal &amp; strategy</h2>
+<p class="lede">Get the solver running <em>inside the LightWave build system</em> with the smallest possible first step, then climb to a real plugin.</p>
+<p>The C ABI and the final-link recipe are already <span class="pill ok">proven</span> by the standalone Phase-0 spike (<code>crates/ppf-cts-capi/spike/</code>): a C++ host links three libraries and solves a pinned cloth on a real GPU, penetration-free, for 30 frames. The migration does not re-prove the solver &mdash; it proves that the <strong>same link recipe works under premake5 / the Jahley app framework</strong>, with the CRT and CUDA settings the LightWave repo imposes.</p>
+
+<div class="panel">
+  <strong>Two-step climb</strong>
+  <ol style="margin:10px 0 0">
+    <li><strong>Console sandbox</strong> (<code>apps/sandbox/PpfContactSolver</code>) &mdash; a copy of <code>HelloWorld</code>. No LightWave SDK, no UI. Just: does the lib link and the GPU solve run inside <code>E:\lw</code>'s build? <span class="pill todo">this plan</span></li>
+    <li><strong>LightWave <code>.p</code> plugin</strong> &mdash; once the sandbox is green, wrap the same calls in a plugin (Displacement/Master) driving real LightWave geometry. <span class="pill todo">later</span></li>
+  </ol>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. What we are migrating (proven artifacts)</h2>
+<table>
+  <tr><th>Artifact</th><th>What it is</th><th>Produced by</th></tr>
+  <tr><td><code>ppf_cts_capi.lib</code></td><td>Rust C-ABI driver (staticlib). Contains the driver + <em>unresolved</em> CUDA backend symbols, resolved at final link.</td><td><code>cargo build -p ppf-cts-capi --release</code> &rarr; <code>target/release/</code></td></tr>
+  <tr><td><code>libsimbackend_cuda.dll</code> + <code>.lib</code></td><td>CUDA backend (kernels) + its import lib.</td><td><code>build-win-native\build-cuda-dll-local.bat</code> &rarr; <code>crates/ppf-cts-solver/src/cpp/build/lib/</code></td></tr>
+  <tr><td><code>ppf_cts.h</code></td><td>cbindgen-generated C header &mdash; the full lifecycle API.</td><td><code>crates/ppf-cts-capi/include/</code></td></tr>
+  <tr><td><code>windows.0.52.0.lib</code></td><td>Import lib the Rust staticlib references (from the <code>windows-targets</code> crate).</td><td>Cargo registry (bundled). Must be <strong>vendored</strong>.</td></tr>
+  <tr><td><code>cudart64_12.dll</code></td><td>CUDA runtime DLL the backend DLL loads at runtime.</td><td><code>%CUDA_PATH%\bin\</code></td></tr>
+</table>
+
+<h3>The proven link line (from <code>spike/build.bat</code>)</h3>
+<pre><span class="c">// final link pulls these together:</span>
+ppf_cts_capi.lib            <span class="c">// Rust driver (staticlib)</span>
+libsimbackend_cuda.lib      <span class="c">// CUDA backend import lib</span>
+cudart.lib                  <span class="c">// CUDA runtime</span>
++ system libs: ntdll advapi32 cfgmgr32 credui gdi32 kernel32 msimg32 opengl32
+               secur32 user32 winspool userenv ws2_32 dbghelp
+               legacy_stdio_definitions  + windows.0.52.0.lib</pre>
+<p class="small">The system-lib list is the output of <code>cargo rustc -p ppf-cts-capi --release -- --print native-static-libs</code>. The Jahley app base already links several of these (<code>opengl32</code>, <code>Ws2_32</code>); the rest are added in the sandbox's <code>premake5.lua</code>.</p>
+
+<!-- ============================================================ -->
+<h2>3. Target environment (verified in <code>E:\lw</code>)</h2>
+<div class="grid2">
+  <div class="panel">
+    <h3 style="margin-top:0">Build system</h3>
+    <ul style="margin:0;padding-left:18px">
+      <li>premake5, action <code>vs2022</code></li>
+      <li>App framework: <strong>Jahley</strong> (<code>appCore/source/jahley</code>)</li>
+      <li>Each app <code>dofile</code>s <code>apps/buildTools/app_common.lua</code> &rarr; <code>buildTools/lw_common.lua</code></li>
+      <li><code>outputdir</code> = <code>Release-windows-x86_64</code> / <code>Debug-windows-x86_64</code></li>
+      <li>Prebuilt libs auto-found via <code>libdirs { lw_thirdparty/builds/bin/&lt;outputdir&gt;/** }</code></li>
+    </ul>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0">Toolchain &amp; CUDA</h3>
+    <ul style="margin:0;padding-left:18px">
+      <li>C++20, MSVC VS2022</li>
+      <li>CUDA <strong>v12.9</strong> &mdash; <span class="pill ok">matches solver build</span></li>
+      <li>OptiX 9.1.0 (not needed here)</li>
+      <li><code>staticruntime "On"</code> &rarr; <code>/MT</code> &nbsp;<span class="pill risk">CRT conflict</span></li>
+      <li>Existing <code>apps/sandbox/CudaCompile</code> already links <code>cuda</code> / <code>cudart_static</code> &mdash; CUDA apps are a solved case here.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Compatibility risks (resolve before / during sandbox)</h2>
+<table>
+  <tr><th>#</th><th>Risk</th><th>Severity</th><th>Resolution</th></tr>
+  <tr>
+    <td class="num">1</td>
+    <td><strong>CRT mismatch.</strong> The spike linked <code>/MD</code> (dynamic CRT). LightWave sets <code>staticruntime "On"</code> = <code>/MT</code>. Rust staticlibs default to the dynamic CRT (<code>/MD</code>-equivalent). Mixing <code>/MT</code> and <code>/MD</code> in one link is the classic LNK2038 / duplicate-symbol failure.</td>
+    <td><span class="pill risk">high</span></td>
+    <td>Pick one CRT for the whole link. Two options:<br>
+      <strong>(a)</strong> Build the Rust capi with the static CRT: <code>RUSTFLAGS="-C target-feature=+crt-static"</code>, then the sandbox keeps <code>staticruntime "On"</code>. <em>Cleaner, matches lw convention.</em><br>
+      <strong>(b)</strong> Override the sandbox to <code>staticruntime "Off"</code> (<code>/MD</code>) to match the spike, and ship the VC++ redist DLLs. Faster to first-light, deviates from lw norm.<br>
+      <em>Recommend (a); fall back to (b) if <code>+crt-static</code> surfaces issues with the backend DLL.</em></td>
+  </tr>
+  <tr>
+    <td class="num">2</td>
+    <td><strong>cudart static vs dynamic.</strong> lw apps link <code>cudart_static</code>; the spike linked dynamic <code>cudart.lib</code> + shipped <code>cudart64_12.dll</code>. The backend <em>DLL</em> has its own CUDA runtime regardless.</td>
+    <td><span class="pill risk">med</span></td>
+    <td>The backend DLL is self-contained (loads <code>cudart64_12.dll</code> at runtime). The sandbox itself does no CUDA, so it needs <em>no</em> cudart link of its own for the solver path. Keep it simple: link nothing CUDA in the app; just ship <code>cudart64_12.dll</code> next to the <code>.exe</code> for the backend DLL. Only add <code>cudart_static</code> if the app grows its own CUDA code.</td>
+  </tr>
+  <tr>
+    <td class="num">3</td>
+    <td><strong>Vendored <code>windows.0.52.0.lib</code> drift.</strong> Its path lives deep in the cargo registry and changes with crate versions.</td>
+    <td><span class="pill risk">low</span></td>
+    <td>Copy it into the vendored dep folder (§5) at build time and link by explicit path, so lw never reaches into the cargo registry.</td>
+  </tr>
+  <tr>
+    <td class="num">4</td>
+    <td><strong>Eigen header collision.</strong> lw bundles a stripped <code>eigen34</code> (CPU-only) on its include path; the CUDA backend needs full Eigen 3.4.0.</td>
+    <td><span class="pill ok">none here</span></td>
+    <td>Non-issue for the sandbox: Eigen is compiled <em>into</em> the prebuilt backend DLL. The sandbox only <code>#include</code>s the C header <code>ppf_cts.h</code>, which pulls no Eigen. Just don't add the solver's C++ sources to the lw build.</td>
+  </tr>
+  <tr>
+    <td class="num">5</td>
+    <td><strong>Solver log noise.</strong> <code>SimpleLog</code> dumps a full advance trace per step to stdout.</td>
+    <td><span class="pill ok">cosmetic</span></td>
+    <td>Fine for the sandbox proof. Quiet it before the plugin / any CI harness.</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>5. Where the dependencies go (vcpkg static triplet)</h2>
+<p>The solver is a prebuilt-only dependency &mdash; no <code>premake5.lua</code> of its own (nothing to compile), just headers, libs, and the runtime DLLs. <strong>As built, the artifacts live in the vcpkg static triplet</strong> that <code>lw_common.lua</code> already wires onto every consumer's include + lib path. This was chosen over a hand-made <code>lw_thirdparty/ppf_cts/</code> folder so the sandbox needs <em>no</em> custom <code>includedirs</code>/<code>libdirs</code> at all &mdash; only <code>links{}</code>.</p>
+<pre>E:\lw\lw_thirdparty\vcpkg\installed\x64-windows-static\
+├── include\
+│   └── ppf_cts.h                      <span class="c">// from crates/ppf-cts-capi/include/</span>
+├── lib\
+│   ├── ppf_cts_capi.lib               <span class="c">// from target/release/ (+crt-static)</span>
+│   ├── libsimbackend_cuda.lib         <span class="c">// from .../src/cpp/build/lib/</span>
+│   └── windows.0.52.0.lib             <span class="c">// vendored from cargo registry</span>
+└── bin\                               <span class="c">// created manually: static triplet ships no bin/</span>
+    ├── libsimbackend_cuda.dll         <span class="c">// staged next to the .exe at build time</span>
+    └── cudart64_12.dll                <span class="c">// from %CUDA_PATH%\bin\</span></pre>
+<div class="callout">
+  <strong>Convention choice (resolved).</strong> <code>lw_common.lua</code> already adds the vcpkg static triplet's <code>include</code> + <code>lib</code> (Release), <code>debug/lib</code> (Debug), and <code>CUDA v12.9/lib/x64</code> to every consumer's search paths. By dropping the solver artifacts into that triplet, the sandbox <code>premake5.lua</code> declares <strong>only <code>links{}</code></strong> &mdash; no explicit <code>includedirs</code>/<code>libdirs</code>, no touching shared build files. The vcpkg static triplet has no <code>bin/</code> directory, so one is created by hand to hold the two runtime DLLs; a postbuild step copies them next to the <code>.exe</code>. (A hand-made self-contained <code>lw_thirdparty/ppf_cts/</code> folder was prototyped and rejected in favor of this.)
+</div>
+
+<!-- ============================================================ -->
+<h2>6. The sandbox app (copy of <code>HelloWorld</code>)</h2>
+<p>Create <code>E:\lw\apps\sandbox\PpfContactSolver\</code> mirroring <code>HelloWorld</code> (<code>premake5.lua</code> + <code>source\Application.cpp</code>). The app uses the Jahley <code>Jahley::App</code> base but the solver logic is plain C calls &mdash; portable straight from <code>spike.cpp</code>.</p>
+
+<h3>6a. <code>premake5.lua</code> (as built &mdash; Release-only)</h3>
+<p>Because the artifacts live in the vcpkg static triplet that <code>lw_common.lua</code> already adds to the include + lib paths, the project declares <strong>no</strong> custom <code>includedirs</code>/<code>libdirs</code> &mdash; just the bare clone plus a Release <code>links{}</code> block and a postbuild DLL-staging step. <strong>Release-only:</strong> the Rust capi always links the release CRT (<code>libcmt</code>); there is no <code>libcmtd</code>, so a <code>/MTd</code> Debug app cannot statically link it (see Risk #1).</p>
+<pre><span class="c">// ... bare HelloWorld-clone header (kind, location, files, staticruntime "On") ...</span>
+    dofile(path.join(ROOT, <span class="s">"apps/buildTools/app_common.lua"</span>))
+
+    <span class="k">local</span> VCPKG_BIN = path.join(ROOT,
+        <span class="s">"lw_thirdparty/vcpkg/installed/x64-windows-static/bin"</span>)
+
+    filter <span class="s">"configurations:Release"</span>
+        links {
+            <span class="s">"ppf_cts_capi"</span>, <span class="s">"libsimbackend_cuda"</span>, <span class="s">"cudart"</span>, <span class="s">"windows.0.52.0"</span>,
+            <span class="c">// native-static-libs not already linked by app_common:</span>
+            <span class="s">"ntdll"</span>,<span class="s">"advapi32"</span>,<span class="s">"cfgmgr32"</span>,<span class="s">"credui"</span>,<span class="s">"gdi32"</span>,<span class="s">"msimg32"</span>,
+            <span class="s">"secur32"</span>,<span class="s">"user32"</span>,<span class="s">"winspool"</span>,<span class="s">"userenv"</span>,<span class="s">"dbghelp"</span>,
+            <span class="s">"legacy_stdio_definitions"</span>,
+        }
+        postbuildcommands {
+            <span class="s">'{COPYFILE} "'</span> .. VCPKG_BIN .. <span class="s">'/libsimbackend_cuda.dll" "%{cfg.targetdir}"'</span>,
+            <span class="s">'{COPYFILE} "'</span> .. VCPKG_BIN .. <span class="s">'/cudart64_12.dll" "%{cfg.targetdir}"'</span>,
+        }
+    filter {}</pre>
+<p class="small"><code>app_common.lua</code> brings in <code>AppCore</code>, <code>mace_core</code>, <code>g3log</code>, <code>opengl32</code>, <code>Ws2_32</code>, C++20, the static runtime, and &mdash; via <code>lw_common.lua</code> &mdash; the vcpkg static triplet include/lib paths and the CUDA toolkit lib path. So the project only declares the solver-specific <code>links{}</code> and stages the DLLs. (<code>cudart</code> resolves to the import lib in <code>CUDA v12.9/lib/x64</code>; the matching <code>cudart64_12.dll</code> is staged for the backend DLL.)</p>
+
+<h3>6b. <code>source\Application.cpp</code></h3>
+<p>Wrap the spike's lifecycle inside the Jahley app shell. The body is a near-verbatim port of <code>spike.cpp</code> &mdash; <code>create &rarr; default_params/material &rarr; set_geometry(cloth grid) &rarr; set_pins &rarr; initialize &rarr; step&times;30 &rarr; read_positions &rarr; intersection_count &rarr; destroy</code> &mdash; with <code>printf</code> swapped for <code>LOG(INFO)</code> and the pass/fail surfaced through the app.</p>
+<pre><span class="cp">#include</span> <span class="s">"Jahley.h"</span>
+<span class="cp">#include</span> <span class="s">"ppf_cts.h"</span>
+<span class="c">// ... port the body of spike.cpp main() into Application's ctor / a run() method,</span>
+<span class="c">//     asserting ppf_cts_intersection_count(ctx) == 0 every frame.</span></pre>
+
+<!-- ============================================================ -->
+<h2>7. Step-by-step checklist</h2>
+<div class="panel">
+  <h3 style="margin-top:0">Phase A &mdash; vendor the artifacts <span class="pill ok">done</span></h3>
+  <ul class="check">
+    <li>&#10003; Rebuilt capi with the static CRT: <code>$env:RUSTFLAGS="-C target-feature=+crt-static"; cargo build -p ppf-cts-capi --release</code> (Risk #1 option a) &mdash; confirmed <code>/defaultlib:libcmt</code></li>
+    <li>&#10003; Copied <code>ppf_cts.h</code> &rarr; <code>vcpkg/installed/x64-windows-static/include\</code></li>
+    <li>&#10003; Copied <code>ppf_cts_capi.lib</code>, <code>libsimbackend_cuda.lib</code>, <code>windows.0.52.0.lib</code> &rarr; <code>...\lib\</code></li>
+    <li>&#10003; Created <code>...\bin\</code> (static triplet ships none) and staged <code>libsimbackend_cuda.dll</code> + <code>cudart64_12.dll</code> there</li>
+  </ul>
+  <h3>Phase B &mdash; create the sandbox <span class="pill ok">done</span></h3>
+  <ul class="check">
+    <li>&#10003; Cloned <code>apps/sandbox/HelloWorld</code> &rarr; <code>apps/sandbox/PpfContactSolver</code>, registered in <code>apps/premake5_apps.lua</code></li>
+    <li>&#10003; Edited <code>premake5.lua</code> per §6a (Release <code>links{}</code> + postbuild DLL staging; no custom include/lib dirs)</li>
+    <li>&#10003; Ported <code>spike.cpp</code> body into <code>source/Application.cpp::runSpike()</code> (in the ctor), <code>LOG(INFO)</code> + per-frame intersection assert</li>
+  </ul>
+  <h3>Phase C &mdash; generate, build, run <span class="pill ok">done</span></h3>
+  <ul class="check">
+    <li>&#10003; Regenerated the VS solution: <code>premake5 --file=premake5_apps.lua vs2022</code></li>
+    <li>&#10003; Built <code>PpfContactSolver</code> Release x64 &mdash; clean link, no LNK2038 / unresolved-externals</li>
+    <li>&#10003; DLLs staged next to the <code>.exe</code> automatically by the postbuild step</li>
+    <li>&#10003; Ran on the GPU &rarr; <strong>&ldquo;PASS: 30 frames solved, penetration-free.&rdquo;</strong> &mdash; all frames <code>intersections=0</code>, ABI=1, 121 verts / 200 faces</li>
+  </ul>
+  <h3>Phase D &mdash; lock it in</h3>
+  <ul class="check">
+    <li>Capture the exact stage-deps steps (copy into the vcpkg triplet) as a repeatable script</li>
+    <li>Note the proven CRT + link set in the sandbox README</li>
+    <li>Quiet the solver's per-step <code>SimpleLog</code> trace before the plugin step</li>
+    <li>Next milestone: the actual <code>.p</code> plugin (see <code>plugins/RiPR2</code> for the <code>.p</code> + <code>serv.def</code> + <code>.support</code> bundle pattern)</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. After the sandbox: the <code>.p</code> plugin</h2>
+<p>The sandbox proves <em>linking + solving under lw's build</em>. The plugin step (separate plan) then adds, on top of that same dependency:</p>
+<ul>
+  <li>Plugin class &amp; registration (<code>ServerRecord</code>, <code>ModuleDescriptor</code>) &mdash; likely a <strong>Displacement</strong> handler (per-frame vertex write-back) or a <strong>Master</strong>/<strong>LayoutGeneric</strong> driver.</li>
+  <li>Geometry bridge: LightWave mesh &harr; the flat <code>vertices/faces</code> arrays <code>ppf_cts_set_geometry</code> expects; pin selection &harr; <code>ppf_cts_set_pins</code>; LightWave motion &harr; <code>ppf_cts_update_pin_targets</code>.</li>
+  <li>Frame loop owned by LightWave's evaluation instead of a <code>for</code> loop.</li>
+  <li>Build kind changes from <code>ConsoleApp</code> to a <code>.p</code> shared lib (see <code>plugins/</code> + the LightWave SDK skill); the <em>solver link recipe is unchanged</em>.</li>
+</ul>
+<div class="callout good">
+  <strong>Key insight that de-risks the whole effort:</strong> the solver is consumed purely through the C header <code>ppf_cts.h</code> and three prebuilt libs. Nothing about the sandbox &rarr; plugin transition touches the solver, CUDA, or Eigen. Once the sandbox links and runs, the plugin is &ldquo;the same calls, different host.&rdquo;
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Decisions (all resolved &mdash; recorded for the record)</h2>
+<table>
+  <tr><th>Decision</th><th>Options</th><th>Recommendation</th></tr>
+  <tr><td>CRT (Risk #1)</td><td>(a) capi <code>+crt-static</code> &amp; app <code>/MT</code> &nbsp; vs &nbsp; (b) app <code>/MD</code></td><td><strong>(a)</strong> &mdash; matches lw convention</td></tr>
+  <tr><td>Dep placement</td><td>self-contained <code>ppf_cts/</code> w/ explicit paths &nbsp; vs &nbsp; <strong>vcpkg static triplet</strong> (links-only)</td><td><strong>vcpkg static triplet</strong> &mdash; resolved; self-contained folder rejected</td></tr>
+  <tr><td>App name</td><td><code>PpfContactSolver</code> / <code>CtsSandbox</code> / other</td><td><code>PpfContactSolver</code></td></tr>
+  <tr><td>Debug config</td><td>build Debug libs now &nbsp; vs &nbsp; Release-only first light</td><td><strong>Release-only</strong> to reach first light fastest</td></tr>
+</table>
+
+<footer>
+  ppf-contact-solver &rarr; LightWave migration plan &bull; Phases A&ndash;C complete: sandbox links &amp; solves penetration-free on GPU &bull; companion to <code>crates/ppf-cts-capi/DESIGN.md</code>.
+</footer>
+
+</div>
+</body>
+</html>

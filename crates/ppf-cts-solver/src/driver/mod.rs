@@ -265,7 +265,7 @@ fn with_device<T>(
 /// For `ppf-contact-solver --probe`. The device is opened afresh and dropped at
 /// the end of this call, never stored in [`DEVICE`], because a probe runs no
 /// step and the process exits right after.
-pub(crate) fn probe_device() -> Result<String, String> {
+pub fn probe_device() -> Result<String, String> {
     use ppf_cts_compute::Device as _;
     launch::try_backend().map(|device| device.info().device_name.clone())
 }

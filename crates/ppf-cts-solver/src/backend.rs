@@ -408,6 +408,57 @@ impl Backend {
         self.state.prev_dt = prev_dt;
     }
 
+    /// In-memory `initialize` for embedders (the `ppf-cts-capi` / LightWave
+    /// path) that drive the solver one step at a time and have no output
+    /// directory, collision-window table, force-field file or `Scene`. This
+    /// is the device-allocation half of `run`'s prologue plus the multigrid
+    /// install (a no-op unless the params name that preconditioner). Callers
+    /// own the frame loop and call [`Backend::step_in_memory`] per step.
+    ///
+    /// `param` must stay at a stable address for the whole session: the
+    /// backend keeps the pointer and reads/writes it on every `advance`.
+    pub fn initialize_in_memory(&mut self, dataset: &DataSet, param: &ParamSet) -> bool {
+        if !unsafe { initialize(dataset, param) } {
+            return false;
+        }
+        crate::driver::install_multigrid(&self.mesh.vertex);
+        true
+    }
+
+    /// One in-memory solver step for embedders. Mirrors the body of `run`'s
+    /// loop minus the file IO, frame detection, GPU-clock sampling and the
+    /// `Scene`-driven param/velocity/rest-shape/material updates: push the
+    /// caller-built pin constraint, refresh collision activation for the
+    /// current sim time, advance, and on success pull the new vertex
+    /// positions back into `self.state` and bump `self.state.time`.
+    ///
+    /// On failure the state is left untouched (time not advanced, vertices
+    /// not fetched); callers inspect `.success()` on the result.
+    pub fn step_in_memory(
+        &mut self,
+        dataset: &DataSet,
+        param: &ParamSet,
+        constraint: &Constraint,
+    ) -> StepResult {
+        unsafe {
+            update_constraint(constraint);
+            refresh_collision_active(self.state.time as f32);
+        }
+        let mut result = StepResult::default();
+        unsafe { advance(&mut result) };
+        if result.success() {
+            self.state.time = result.time;
+            self.fetch_state(dataset, param);
+        }
+        result
+    }
+
+    /// Number of intersection records the backend currently holds. The
+    /// penetration-free invariant means this reads 0 after a successful step.
+    pub fn intersection_count(&self) -> u32 {
+        fetch_records().len() as u32
+    }
+
     pub fn load_state(frame: i32, dirpath: &str) -> Self {
         let (mesh, state) = {
             let path_mesh = format!("{dirpath}/{}", ppf_cts_formats::files::MESHSET);

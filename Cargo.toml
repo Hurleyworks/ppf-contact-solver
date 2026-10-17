@@ -10,6 +10,7 @@
 # modern (per-target) resolver every member already assumed.
 resolver = "2"
 members = [
+    "crates/ppf-cts-capi",
     "crates/ppf-cts-formats",
     "crates/ppf-cts-compute",
     "crates/ppf-cts-core",
