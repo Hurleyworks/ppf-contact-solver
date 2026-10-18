@@ -80,6 +80,7 @@ int g_ppf_kernel_timeout_enabled = -1;
 extern "C" int g_ppf_soft_cuda = 0;
 extern "C" int g_ppf_soft_cuda_error = 0;
 extern "C" char g_ppf_soft_cuda_message[512] = {0};
+extern "C" int g_ppf_capture_state = 0;
 
 // Turn soft mode (see cuda_utils.hpp) on or off and clear any latched error.
 extern "C" void ppf_cuda_set_soft(int on) {
@@ -232,6 +233,9 @@ struct BeEncoder {
     // Set when capture was begun at `be_encode_begin`, so the close knows
     // whether it has a capture to end.
     bool capturing;
+    // Set when a capture was invalidated from outside mid-region and ended
+    // early; the close then records the re-issue form instead of a graph.
+    bool invalidated;
 };
 
 struct BeBackend {
@@ -1279,6 +1283,7 @@ extern "C" BeStatus be_encode_begin(BeBackend *be, const char *region,
     enc->dispatch_count = 0;
     enc->fill_count = 0;
     enc->capturing = false;
+    enc->invalidated = false;
     // CAPTURE BEGINS HERE AND NOT AT THE CLOSE, which is why the mode is
     // stated at open at all: CUDA has to be capturing before the first launch
     // is issued, so a library cannot decide after the fact which of the two it
@@ -1288,6 +1293,7 @@ extern "C" BeStatus be_encode_begin(BeBackend *be, const char *region,
             be->queue, cudaStreamCaptureModeThreadLocal);
         if (code == cudaSuccess) {
             enc->capturing = true;
+            g_ppf_capture_state = 1;
         } else if (be->require_deferred) {
             delete enc;
             return set_error(err, STATUS_NO_DEFERRAL,
@@ -1310,6 +1316,28 @@ extern "C" BeStatus be_encode_begin(BeBackend *be, const char *region,
     *out = enc;
     return STATUS_OK;
 }
+
+namespace {
+
+// ENDS A CAPTURE SOMETHING OUTSIDE THIS LIBRARY INVALIDATED (another module in
+// the process loading CUDA code mid-region). Nothing captured has run, so the
+// items kept so far plus those encoded after this are the whole region, and
+// the close records it in the re-issue form. Ending the capture is what puts
+// the stream back to ordinary work; a partial graph is dropped, and the
+// launch's error is cleared so the next launch does not report it.
+void drop_invalidated_capture(BeEncoder *enc) {
+    cudaGraph_t graph = nullptr;
+    (void)cudaStreamEndCapture(enc->backend->queue, &graph);
+    if (graph) {
+        cudaGraphDestroy(graph);
+    }
+    (void)cudaGetLastError();
+    enc->capturing = false;
+    enc->invalidated = true;
+    g_ppf_capture_state = 0;
+}
+
+} // namespace
 
 extern "C" BeStatus be_encode_dispatch(BeEncoder *enc, uint32_t kernel_id,
                                             const BeExtent *extent,
@@ -1407,6 +1435,13 @@ extern "C" BeStatus be_encode_dispatch(BeEncoder *enc, uint32_t kernel_id,
                       enc->backend->queue);
         }
         const cudaError_t code = cudaGetLastError();
+        // A generated launcher consumes the runtime's error itself, so the
+        // invalidation arrives either here or as the state `HandleError` set.
+        if (code == cudaErrorStreamCaptureInvalidated ||
+            g_ppf_capture_state == 2) {
+            drop_invalidated_capture(enc);
+            return STATUS_OK;
+        }
         if (code != cudaSuccess) {
             return fault(enc->backend, err, code,
                          std::string("capturing a launch of ") + row.name);
@@ -1447,6 +1482,10 @@ extern "C" BeStatus be_encode_fill(BeEncoder *enc, BeHandle dst,
     if (enc->capturing && bytes > 0) {
         const cudaError_t code = cudaMemsetAsync(
             base, value, static_cast<size_t>(bytes), enc->backend->queue);
+        if (code == cudaErrorStreamCaptureInvalidated) {
+            drop_invalidated_capture(enc);
+            return STATUS_OK;
+        }
         if (code != cudaSuccess) {
             return fault(enc->backend, err, code, "capturing a fill");
         }
@@ -1574,6 +1613,11 @@ extern "C" BeStatus be_encode_record(BeEncoder *enc, BeRegion **out,
     if (enc->capturing) {
         cudaGraph_t graph = nullptr;
         cudaError_t code = cudaStreamEndCapture(be->queue, &graph);
+        g_ppf_capture_state = 0;
+        if (code != cudaSuccess && graph) {
+            cudaGraphDestroy(graph);
+            graph = nullptr;
+        }
         if (code == cudaSuccess && graph) {
             cudaGraphExec_t exec = nullptr;
             code = cudaGraphInstantiate(&exec, graph, 0);
@@ -1603,6 +1647,22 @@ extern "C" BeStatus be_encode_record(BeEncoder *enc, BeRegion **out,
                          cudaGetErrorString(code) +
                          "); this region will replay by re-issuing dispatches");
         }
+    } else if (enc->invalidated) {
+        // Ended early by `drop_invalidated_capture`; the same verdict as a
+        // capture that yielded no graph, reported once for this region.
+        if (be->require_deferred) {
+            const BeStatus status = set_error(
+                err, STATUS_NO_DEFERRAL,
+                static_cast<long long>(cudaErrorStreamCaptureInvalidated),
+                "stream capture was invalidated by other CUDA work in the "
+                "process");
+            delete region;
+            close_encoder(enc);
+            return status;
+        }
+        emit_log(be, 1,
+                 "stream capture was invalidated by other CUDA work in the "
+                 "process; this region will replay by re-issuing dispatches");
     }
     close_encoder(enc);
 
@@ -1627,6 +1687,7 @@ extern "C" void be_encode_abandon(BeEncoder *enc) {
             cudaGraphDestroy(graph);
         }
         (void)cudaGetLastError();
+        g_ppf_capture_state = 0;
     }
     close_encoder(enc);
 }

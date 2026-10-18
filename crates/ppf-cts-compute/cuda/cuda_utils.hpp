@@ -54,6 +54,17 @@ extern "C" int g_ppf_soft_cuda;
 extern "C" int g_ppf_soft_cuda_error;
 extern "C" char g_ppf_soft_cuda_message[512];
 
+// STREAM CAPTURE STATE of the backend's one recording encoder: 0 when no
+// capture is open, 1 while one is, 2 once a launch has reported it
+// invalidated. Another module in the same process (a renderer loading CUDA
+// modules on its own thread) can invalidate a capture from outside, and the
+// launch made into it then reports cudaErrorStreamCaptureInvalidated. That is
+// not a fault: nothing captured has run, so `HandleError` marks it here and
+// returns, and the backend ends the capture and replays the region by
+// re-issuing its dispatches. Defined once in
+// crates/ppf-cts-compute/cuda/backend/backend.cu.
+extern "C" int g_ppf_capture_state;
+
 // Which crash sub-kind a `cudaError_t` reports as. Three errors carry a cause
 // the user can act on differently from "the CUDA runtime failed":
 // an allocation failure means the scene does not fit, cudaErrorAssert means a
@@ -78,6 +89,11 @@ static unsigned char fatal_code_for_cuda(cudaError_t err) {
 }
 
 static void HandleError(cudaError_t err, const char *file, int line) {
+    if (err == cudaErrorStreamCaptureInvalidated && g_ppf_capture_state != 0) {
+        // See g_ppf_capture_state above; outside a capture it stays an error.
+        g_ppf_capture_state = 2;
+        return;
+    }
     if (err != cudaSuccess) {
         printf("%s in %s at line %d\n", cudaGetErrorString(err), file, line);
         // Label the imminent exit(1) so the host's atexit hook can name the
