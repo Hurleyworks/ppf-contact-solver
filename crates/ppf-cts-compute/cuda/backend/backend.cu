@@ -77,6 +77,16 @@ extern "C" char g_ppf_fatal_detail[512] = {0};
 unsigned long long g_device_alloc_count = 0;
 unsigned long long g_device_free_count = 0;
 int g_ppf_kernel_timeout_enabled = -1;
+extern "C" int g_ppf_soft_cuda = 0;
+extern "C" int g_ppf_soft_cuda_error = 0;
+extern "C" char g_ppf_soft_cuda_message[512] = {0};
+
+// Turn soft mode (see cuda_utils.hpp) on or off and clear any latched error.
+extern "C" void ppf_cuda_set_soft(int on) {
+    g_ppf_soft_cuda = on;
+    g_ppf_soft_cuda_error = 0;
+    g_ppf_soft_cuda_message[0] = '\0';
+}
 
 // The arena's binding budget and the ABI's are the same number by construction
 // rather than by coincidence: a handle's arena id means one thing across every
@@ -308,6 +318,17 @@ BeBackend *g_backend = nullptr;
 // DEVICE_LOST once a fault has been reported, so a driver that ignores the
 // first fault cannot proceed on stale device data.
 bool lost(BeBackend *be, BeError *err) {
+    // A soft-mode error latched by `HandleError` loses the context too, and
+    // its own message is the one worth reporting.
+    if (g_ppf_soft_cuda_error != 0) {
+        if (be) {
+            be->device_lost = true;
+        }
+        set_error(err, STATUS_DEVICE_LOST,
+                  static_cast<long long>(g_ppf_soft_cuda_error),
+                  g_ppf_soft_cuda_message);
+        return true;
+    }
     if (be && be->device_lost) {
         set_error(err, STATUS_DEVICE_LOST, 0,
                   "the CUDA context was lost by an earlier device fault and "
@@ -325,6 +346,20 @@ BeStatus fault(BeBackend *be, BeError *err, cudaError_t code,
     return set_error(err, STATUS_DEVICE_FAULT,
                      static_cast<long long>(code),
                      what + ": " + cudaGetErrorString(code));
+}
+
+// A soft-mode error latched during the call just made (a generated launch
+// wrapper or the arena consumes the runtime's error itself), reported as the
+// device fault it is. False when nothing is latched.
+bool latched_fault(BeBackend *be, BeError *err, BeStatus *status) {
+    if (g_ppf_soft_cuda_error == 0) {
+        return false;
+    }
+    be->device_lost = true;
+    *status = set_error(err, STATUS_DEVICE_FAULT,
+                        static_cast<long long>(g_ppf_soft_cuda_error),
+                        g_ppf_soft_cuda_message);
+    return true;
 }
 
 // Defined with the transfers it also serves, below. Declared here because a
@@ -399,6 +434,10 @@ BeStatus run_items(BeBackend *be, const std::vector<Item> &items,
         if (code != cudaSuccess) {
             return fault(be, err, code,
                          std::string("launching ") + row.name);
+        }
+        BeStatus status = STATUS_OK;
+        if (latched_fault(be, err, &status)) {
+            return status;
         }
     }
     return STATUS_OK;
@@ -498,6 +537,10 @@ extern "C" BeStatus be_open(const BeBackendConfig *config,
     if (config->diag_ring_slots == 0) {
         return misuse(err, "the diagnostic ring needs at least one slot");
     }
+    // A fresh open starts with no latched soft-mode error; a context that is
+    // still broken fails the checks below by name.
+    g_ppf_soft_cuda_error = 0;
+    g_ppf_soft_cuda_message[0] = '\0';
     // The device is selected and the context created here rather than lazily,
     // so a host with no usable device fails at open, by name, with nothing to
     // fall back to.
@@ -869,6 +912,10 @@ extern "C" BeStatus be_alloc(BeBackend *be, size_t count,
                                &detail)) {
         return set_error(err, STATUS_BAD_ALLOC, 0, detail);
     }
+    BeStatus latched = STATUS_OK;
+    if (latched_fault(be, err, &latched)) {
+        return latched;
+    }
     be->generation += 1;
     // A ZERO-COUNT REQUEST REGISTERS NO BLOCK, so it gets no label. The key is
     // (arena, offset) and such a handle names (0, 0), which is also where the
@@ -918,6 +965,10 @@ extern "C" BeStatus be_grow(BeBackend *be, BeHandle *handle,
     if (!compute::arena::grow(be->allocator, handle, new_count, elem_size,
                               align, &detail)) {
         return set_error(err, STATUS_BAD_ALLOC, 0, detail);
+    }
+    BeStatus latched = STATUS_OK;
+    if (latched_fault(be, err, &latched)) {
+        return latched;
     }
     // THE BLOCK MAY HAVE MOVED, so every copy of the handle held elsewhere is
     // stale, a recorded region included. The generation is what a replay
@@ -1128,6 +1179,10 @@ extern "C" BeStatus be_read_scalars(BeBackend *be, BeHandle handle,
     // per call whatever the size; with a pinned destination the same copy is a
     // direct DMA at about 5 microseconds.
     float *stage = static_cast<float *>(pinned_scratch(bytes));
+    BeStatus latched = STATUS_OK;
+    if (latched_fault(be, err, &latched)) {
+        return latched;
+    }
     const cudaError_t code =
         cudaMemcpy(stage, base, bytes, cudaMemcpyDeviceToHost);
     if (code != cudaSuccess) {
@@ -1355,6 +1410,10 @@ extern "C" BeStatus be_encode_dispatch(BeEncoder *enc, uint32_t kernel_id,
         if (code != cudaSuccess) {
             return fault(enc->backend, err, code,
                          std::string("capturing a launch of ") + row.name);
+        }
+        BeStatus status = STATUS_OK;
+        if (latched_fault(enc->backend, err, &status)) {
+            return status;
         }
     }
     return STATUS_OK;

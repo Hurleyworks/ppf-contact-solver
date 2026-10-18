@@ -43,6 +43,17 @@ extern unsigned long long g_device_free_count;
 // crates/ppf-cts-compute/cuda/backend/backend.cu.
 extern int g_ppf_kernel_timeout_enabled;
 
+// SOFT MODE, for a host that must outlive a CUDA error (the in-process C API
+// inside a 3D application, where another program can take the GPU's memory
+// mid-solve). When `g_ppf_soft_cuda` is nonzero, `HandleError` latches the
+// FIRST error and its one-line message here and returns instead of calling
+// exit(1); the backend then reports the latched error as a device fault at its
+// next status check. Zero (the default) keeps the exit. Defined once in
+// crates/ppf-cts-compute/cuda/backend/backend.cu, set by `ppf_cuda_set_soft`.
+extern "C" int g_ppf_soft_cuda;
+extern "C" int g_ppf_soft_cuda_error;
+extern "C" char g_ppf_soft_cuda_message[512];
+
 // Which crash sub-kind a `cudaError_t` reports as. Three errors carry a cause
 // the user can act on differently from "the CUDA runtime failed":
 // an allocation failure means the scene does not fit, cudaErrorAssert means a
@@ -103,6 +114,26 @@ static void HandleError(cudaError_t err, const char *file, int line) {
                      "; the operating system's kernel-execution watchdog is "
                      "%s on this device",
                      state);
+        }
+        if (g_ppf_soft_cuda) {
+            // First error wins: a later one is usually a consequence of it.
+            if (g_ppf_soft_cuda_error == 0) {
+                g_ppf_soft_cuda_error = (int)err;
+                size_t free_bytes = 0, total_bytes = 0;
+                if (code == FATAL_OOM &&
+                    cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+                    snprintf(g_ppf_soft_cuda_message,
+                             sizeof(g_ppf_soft_cuda_message),
+                             "CUDA out of memory: %zu MB free of %zu MB on "
+                             "the device (%s at line %d)",
+                             free_bytes >> 20, total_bytes >> 20, file, line);
+                } else {
+                    snprintf(g_ppf_soft_cuda_message,
+                             sizeof(g_ppf_soft_cuda_message), "CUDA error: %s",
+                             detail);
+                }
+            }
+            return;
         }
         fatal_set_detail(detail);
         g_ppf_fatal_code = code;

@@ -75,6 +75,12 @@ typedef enum CtsStatus {
      * A Rust panic was caught at the boundary.
      */
     CTS_STATUS_PANIC = 7,
+    /**
+     * The GPU failed during a step (out of memory, a lost context, a
+     * failed launch). The process stays alive; the context can only be
+     * destroyed. [`crate::ppf_cts_last_error`] names the CUDA error.
+     */
+    CTS_STATUS_DEVICE_FAULT = 8,
 } CtsStatus;
 
 /**
@@ -193,6 +199,9 @@ void ppf_cts_set_verbose(int32_t verbose);
 
 /**
  * Allocate a new solver context. Returns null only on allocation panic.
+ * Also puts the solver in soft-failure mode (process-global): a GPU error
+ * during a step is returned as `CTS_STATUS_DEVICE_FAULT` instead of
+ * ending the host process.
  */
 struct CtsContext *ppf_cts_create(void);
 
@@ -251,6 +260,13 @@ enum CtsStatus ppf_cts_set_geometry(struct CtsContext *ctx,
  * means "uniform, every element uses row 0"; a non-null array must hold
  * exactly `face_count` / `tet_count` / `rod_count` entries, each
  * `< material_count`.
+ *
+ * Since ABI 11 every row's `model` must be a known `CtsModel` value, and
+ * every row a tet uses must be a solid row: `model` ARAP, StVK or SNHk
+ * (Baraff-Witkin is shell-only), `young_modulus > 0`,
+ * `0 < poisson_ratio < 0.5` and `density > 0`. Otherwise this returns
+ * `PPF_CTS_ERR_BAD_ARG` and [`ppf_cts_last_error`] names the row. Staging
+ * geometry clears any velocities set by [`ppf_cts_set_velocities`].
  */
 enum CtsStatus ppf_cts_set_geometry_ex(struct CtsContext *ctx,
                                        const float *vertices,
@@ -353,6 +369,16 @@ enum CtsStatus ppf_cts_set_pins(struct CtsContext *ctx,
                                 const float *stiffness);
 
 /**
+ * Per-pin pull weights (`count` floats, one per pin in the `set_pins`
+ * index order; `count` must equal the pin count). A weight `> 0` makes that
+ * pin a soft pull of that weight toward its target (which still follows
+ * [`ppf_cts_update_pin_targets`]); `<= 0` keeps it an exact pin. Call after
+ * [`ppf_cts_set_pins`] (which resets every pin to exact) and before
+ * [`ppf_cts_initialize`].
+ */
+enum CtsStatus ppf_cts_set_pin_pull(struct CtsContext *ctx, const float *weights, uint32_t count);
+
+/**
  * Push per-frame pin target positions (`3*count` floats), aligned with
  * the `set_pins` index order. Pins are exact (Dirichlet) constraints.
  *
@@ -366,6 +392,28 @@ enum CtsStatus ppf_cts_set_pins(struct CtsContext *ctx,
 enum CtsStatus ppf_cts_update_pin_targets(struct CtsContext *ctx,
                                           const float *positions,
                                           uint32_t count);
+
+/**
+ * Set gravity `(x, y, z)` (m/s^2). After [`ppf_cts_initialize`] it is the
+ * value for the NEXT frame boundary (the next multiple of `1/fps`): gravity
+ * moves linearly in sim time from its current value to it over the steps up
+ * to that boundary, then holds, as [`ppf_cts_update_pin_targets`] does. Call
+ * it between frames, before stepping that frame. Before initialize it
+ * replaces the `gravity` given to [`ppf_cts_set_params`] at once.
+ */
+enum CtsStatus ppf_cts_set_gravity(struct CtsContext *ctx, float x, float y, float z);
+
+/**
+ * Set initial vertex velocities (m/s): `3*vertex_count` floats, xyz per
+ * vertex in the same vertex order as [`ppf_cts_set_geometry_ex`].
+ * `vertex_count` must equal that call's vertex count. Call after
+ * [`ppf_cts_set_geometry_ex`] (which clears them) and before
+ * [`ppf_cts_initialize`]; unset velocities are zero. The solver seeds its
+ * previous positions as `x - dt * v`, as the frontend's `vel.bin` does.
+ */
+enum CtsStatus ppf_cts_set_velocities(struct CtsContext *ctx,
+                                      const float *velocities,
+                                      uint32_t vertex_count);
 
 /**
  * Stage SAND granular material. Every grain is a loose vertex (no

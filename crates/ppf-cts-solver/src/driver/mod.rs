@@ -214,6 +214,38 @@ static FATAL_LATCHED: AtomicBool = AtomicBool::new(false);
 /// by value could not satisfy that through a C signature.
 static FATAL_DETAIL: Mutex<Option<std::ffi::CString>> = Mutex::new(None);
 
+/// Soft mode, for a host that must outlive a failed step (the in-process C
+/// API inside a 3D application). When set, a fatal raised by `advance`,
+/// `update_constraint` or `refresh_collision_active` is recorded through
+/// `set_fatal` and the entry point returns instead of exiting; the host reads
+/// `fatal_code()` / `fatal_detail()` and tears the run down. Off by default,
+/// which keeps the process-exit contract the server relies on.
+static SOFT_FATAL: AtomicBool = AtomicBool::new(false);
+
+/// Turn soft mode on or off (see [`SOFT_FATAL`]). On the CUDA library this
+/// also switches its `CUDA_HANDLE_ERROR` from exit(1) to latch-and-return, so a
+/// failed launch or copy reaches the driver as a device fault.
+pub fn set_soft_fatal(on: bool) {
+    SOFT_FATAL.store(on, Ordering::SeqCst);
+    #[cfg(all(cuda_backend, abi_backend_linked))]
+    {
+        extern "C" {
+            fn ppf_cuda_set_soft(on: i32);
+        }
+        // Safety: a plain store into the library's globals.
+        unsafe { ppf_cuda_set_soft(i32::from(on)) };
+    }
+}
+
+/// Forget a recorded fatal, so a fresh `initialize()` starts clean.
+fn clear_fatal() {
+    FATAL_CODE.store(0, Ordering::SeqCst);
+    if let Ok(mut slot) = FATAL_DETAIL.lock() {
+        *slot = None;
+    }
+    FATAL_LATCHED.store(false, Ordering::SeqCst);
+}
+
 /// The live scene, set by `initialize()`.
 ///
 /// The pointers inside `DataSet` are owned by the Rust caller in `backend.rs`
@@ -256,7 +288,20 @@ fn with_device<T>(
             "solver driver: the backend lock is poisoned, so an earlier failure went unreported",
         )
     })?;
-    let device = guard.get_or_insert_with(launch::backend);
+    // TRY_BACKEND, NOT `launch::backend`: the latter panics when the device
+    // cannot be opened, and a panic out of an `extern "C"` entry point aborts
+    // the process. Reopening after a soft fault is the case that can fail.
+    if guard.is_none() {
+        let device = launch::try_backend().map_err(|fault| {
+            Fatal::invariant(format!(
+                "solver driver: the backend could not be opened: {fault}"
+            ))
+        })?;
+        *guard = Some(device);
+    }
+    let Some(device) = guard.as_mut() else {
+        return Err(Fatal::invariant("solver driver: the backend slot is empty"));
+    };
     body(device)
 }
 
@@ -337,6 +382,16 @@ fn fatal_exit(fatal: Fatal) -> ! {
     set_fatal(fatal.code, fatal.detail);
     crate::status_writer::stamp_fatal();
     std::process::exit(1);
+}
+
+/// [`fatal_exit`], except in soft mode, where the fatal is logged and recorded
+/// and the caller returns. The next `initialize()` reopens the device.
+fn report_fatal(fatal: Fatal) {
+    if !SOFT_FATAL.load(Ordering::SeqCst) {
+        fatal_exit(fatal);
+    }
+    ::log::error!("### FATAL: {}", fatal.detail);
+    set_fatal(fatal.code, fatal.detail);
 }
 
 /// The live scene, or a fatal naming the entry point that arrived too early.
@@ -531,6 +586,18 @@ pub unsafe extern "C" fn initialize(data: *const DataSet, param: *const ParamSet
     // The host-phase tally's exit hook, installed here so a run that ends
     // without unwinding still prints it. No-op unless PPF_PHASE_STATS is set.
     phase::register();
+    // A RUN AFTER A SOFT FAULT STARTS OVER. The fatal it recorded is forgotten,
+    // and the solver state and backend it left behind are dropped, so the
+    // device is reopened rather than reused (a lost context answers nothing).
+    if fatal_code() != 0 {
+        if let Ok(mut slot) = SOLVER.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = DEVICE.lock() {
+            *slot = None;
+        }
+    }
+    clear_fatal();
     if data.is_null() || param.is_null() {
         set_fatal(
             ppf_cts_formats::status::error_code::SOLVER_INVARIANT,
@@ -856,19 +923,22 @@ pub unsafe extern "C" fn advance(result: *mut StepResult) {
         .ok()
         .and_then(|slot| slot.as_ref().map(|scene| (scene.is_live(), scene.dataset, scene.param)));
     let Some((true, dataset, param)) = live else {
-        fatal_exit(Fatal::invariant(
+        report_fatal(Fatal::invariant(
             "solver driver: advance() was called before initialize() succeeded",
         ));
+        return;
     };
     let Ok(mut guard) = SOLVER.lock() else {
-        fatal_exit(Fatal::invariant(
+        report_fatal(Fatal::invariant(
             "solver driver: the solver state is poisoned, so an earlier failure went unreported",
         ));
+        return;
     };
     let Some(state) = guard.as_mut() else {
-        fatal_exit(Fatal::invariant(
+        report_fatal(Fatal::invariant(
             "solver driver: initialize() accepted this scene without sizing the solver state",
         ));
+        return;
     };
     // Safety: `backend.rs` owns both records for the whole run, and the host's
     // step loop calls one backend entry point at a time, so no other reference
@@ -877,7 +947,7 @@ pub unsafe extern "C" fn advance(result: *mut StepResult) {
         Ok(outcome) => *result = outcome,
         Err(fatal) => {
             drop(guard);
-            fatal_exit(fatal);
+            report_fatal(fatal);
         }
     }
 }
@@ -1115,13 +1185,15 @@ pub unsafe extern "C" fn update_dyn(_index: *const u32, _offset: *const u32) {}
 #[no_mangle]
 pub unsafe extern "C" fn update_constraint(constraint: *const Constraint) {
     if constraint.is_null() {
-        fatal_exit(Fatal::invariant(
+        report_fatal(Fatal::invariant(
             "solver driver: update_constraint received a null Constraint",
         ));
+        return;
     }
     let view = require_scene("update_constraint");
     if let Err(fatal) = constraint::rebuild(&view, &*constraint) {
-        fatal_exit(fatal);
+        report_fatal(fatal);
+        return;
     }
     // COPY THE PINS, do not keep the handles. `backend.rs` drops the previous
     // `Constraint` and frees its buffers as it assigns the new one, so a
@@ -1138,7 +1210,8 @@ pub unsafe extern "C" fn update_constraint(constraint: *const Constraint) {
             let pull = scene::slice(&(*constraint).pull);
             if let Err(fatal) = with_device(|device| state.stash_pins(device, fix, pull)) {
                 drop(guard);
-                fatal_exit(fatal);
+                report_fatal(fatal);
+                return;
             }
             // THE PER-VERTEX PIN INDICES MUST REACH THE DEVICE TOO, and this is
             // the only place that does it. `constraint::rebuild` has just
@@ -1171,7 +1244,8 @@ pub unsafe extern "C" fn update_constraint(constraint: *const Constraint) {
                 state.restage_element_fixed(device, view.face_props_mut(), view.edge_props_mut())
             }) {
                 drop(guard);
-                fatal_exit(fatal);
+                report_fatal(fatal);
+                return;
             }
             let sphere = scene::slice(&(*constraint).sphere);
             let floor = scene::slice(&(*constraint).floor);
@@ -1179,7 +1253,8 @@ pub unsafe extern "C" fn update_constraint(constraint: *const Constraint) {
                 with_device(|device| state.stash_colliders(device, sphere, floor))
             {
                 drop(guard);
-                fatal_exit(fatal);
+                report_fatal(fatal);
+                return;
             }
             let torque_groups = scene::slice(&(*constraint).torque_groups);
             let torque_vertices = scene::slice(&(*constraint).torque_vertices);
@@ -1187,14 +1262,16 @@ pub unsafe extern "C" fn update_constraint(constraint: *const Constraint) {
                 state.stash_torque(device, torque_groups, torque_vertices)
             }) {
                 drop(guard);
-                fatal_exit(fatal);
+                report_fatal(fatal);
+                return;
             }
             let stitch = scene::slice(&(*constraint).stitch);
             // SOLVER THEN DEVICE, the order `advance` already takes, so the
             // added lock introduces no new pair to order.
             if let Err(fatal) = with_device(|device| state.stash_stitches(device, stitch)) {
                 drop(guard);
-                fatal_exit(fatal);
+                report_fatal(fatal);
+                return;
             }
         }
     }
@@ -1626,7 +1703,7 @@ pub extern "C" fn refresh_collision_active(time: f32) {
         unsafe { table.refresh(device, &view, time) }
     });
     if let Err(fatal) = outcome {
-        fatal_exit(fatal);
+        report_fatal(fatal);
     }
 }
 

@@ -23,7 +23,7 @@ use std::ffi::c_char;
 
 use context::CtsContext;
 use error::{guard, guard_value, last_error_ptr, CtsStatus};
-use params::{CtsColliderMaterial, CtsGlobalParams, CtsMaterial};
+use params::{CtsColliderMaterial, CtsGlobalParams, CtsMaterial, CtsModel};
 use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 
 /// Bumped whenever the C ABI (struct layouts or function signatures)
@@ -41,7 +41,22 @@ use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 ///    shell). `ppf_cts_update_pin_targets` after initialize now moves each pin
 ///    linearly over the steps up to the next frame boundary instead of
 ///    jumping on the first step. Struct layouts are unchanged.
-const ABI_VERSION: u32 = 8;
+/// 9: adds `ppf_cts_set_pin_pull` (per-pin soft pull weight: `> 0` makes the
+///    pin a `PullPair` toward its target instead of an exact `FixPair`).
+///    Struct layouts are unchanged.
+/// 10: adds `ppf_cts_set_gravity` (gravity changeable between frames, blended
+///    to the next frame boundary like pin targets). Struct layouts are
+///    unchanged.
+/// 11: adds `ppf_cts_set_velocities` (initial vertex velocities, m/s).
+///    `ppf_cts_set_geometry_ex` now rejects an unknown material model, and a
+///    tet whose material row is not a solid row (ARAP/StVK/SNHk, E > 0,
+///    0 < nu < 0.5, density > 0). Struct layouts are unchanged.
+/// 12: a CUDA error during a step (out of memory, a failed launch, a lost
+///    context) no longer ends the process: `ppf_cts_step` returns the new
+///    `CTS_STATUS_DEVICE_FAULT` (8) with the CUDA message in
+///    [`ppf_cts_last_error`]. Destroy the context; a new one re-opens the
+///    device. Struct layouts are unchanged.
+const ABI_VERSION: u32 = 12;
 
 /// Current C ABI version. Callers compare against their compiled header.
 #[no_mangle]
@@ -91,9 +106,13 @@ pub extern "C" fn ppf_cts_set_verbose(verbose: i32) {
 }
 
 /// Allocate a new solver context. Returns null only on allocation panic.
+/// Also puts the solver in soft-failure mode (process-global): a GPU error
+/// during a step is returned as `CTS_STATUS_DEVICE_FAULT` instead of
+/// ending the host process.
 #[no_mangle]
 pub extern "C" fn ppf_cts_create() -> *mut CtsContext {
     apply_verbose();
+    ppf_cts_solver::driver::set_soft_fatal(true);
     guard_value(std::ptr::null_mut(), || {
         Box::into_raw(Box::new(CtsContext::new()))
     })
@@ -207,6 +226,13 @@ pub extern "C" fn ppf_cts_set_geometry(
 /// means "uniform, every element uses row 0"; a non-null array must hold
 /// exactly `face_count` / `tet_count` / `rod_count` entries, each
 /// `< material_count`.
+///
+/// Since ABI 11 every row's `model` must be a known `CtsModel` value, and
+/// every row a tet uses must be a solid row: `model` ARAP, StVK or SNHk
+/// (Baraff-Witkin is shell-only), `young_modulus > 0`,
+/// `0 < poisson_ratio < 0.5` and `density > 0`. Otherwise this returns
+/// `PPF_CTS_ERR_BAD_ARG` and [`ppf_cts_last_error`] names the row. Staging
+/// geometry clears any velocities set by [`ppf_cts_set_velocities`].
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn ppf_cts_set_geometry_ex(
@@ -237,6 +263,18 @@ pub extern "C" fn ppf_cts_set_geometry_ex(
         if materials.is_null() || material_count == 0 {
             error::set_last_error("set_geometry_ex: materials null or empty");
             return CtsStatus::BadArg;
+        }
+        // `model` is the struct's first field (a repr(u32) enum). Read it raw
+        // before forming `&[CtsMaterial]`: a value outside the enum would be
+        // undefined behaviour once typed.
+        for row in 0..material_count as usize {
+            let model = unsafe { std::ptr::read(materials.add(row).cast::<u32>()) };
+            if model > CtsModel::SNHk as u32 {
+                error::set_last_error(format!(
+                    "set_geometry_ex: material row {row}: unknown model {model}"
+                ));
+                return CtsStatus::BadArg;
+            }
         }
         if shell_face_count > face_count {
             error::set_last_error("set_geometry: shell_face_count exceeds face_count");
@@ -446,6 +484,31 @@ pub extern "C" fn ppf_cts_set_pins(
     })
 }
 
+/// Per-pin pull weights (`count` floats, one per pin in the `set_pins`
+/// index order; `count` must equal the pin count). A weight `> 0` makes that
+/// pin a soft pull of that weight toward its target (which still follows
+/// [`ppf_cts_update_pin_targets`]); `<= 0` keeps it an exact pin. Call after
+/// [`ppf_cts_set_pins`] (which resets every pin to exact) and before
+/// [`ppf_cts_initialize`].
+#[no_mangle]
+pub extern "C" fn ppf_cts_set_pin_pull(
+    ctx: *mut CtsContext,
+    weights: *const f32,
+    count: u32,
+) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        if weights.is_null() && count != 0 {
+            error::set_last_error("set_pin_pull: null weights with non-zero count");
+            return CtsStatus::BadArg;
+        }
+        let weights = unsafe { slice_f32(weights, count as usize) };
+        ctx.set_pin_pull(weights)
+    })
+}
+
 /// Push per-frame pin target positions (`3*count` floats), aligned with
 /// the `set_pins` index order. Pins are exact (Dirichlet) constraints.
 ///
@@ -471,6 +534,47 @@ pub extern "C" fn ppf_cts_update_pin_targets(
         }
         let positions = unsafe { slice_f32(positions, 3 * count as usize) };
         ctx.update_pin_targets(positions)
+    })
+}
+
+/// Set gravity `(x, y, z)` (m/s^2). After [`ppf_cts_initialize`] it is the
+/// value for the NEXT frame boundary (the next multiple of `1/fps`): gravity
+/// moves linearly in sim time from its current value to it over the steps up
+/// to that boundary, then holds, as [`ppf_cts_update_pin_targets`] does. Call
+/// it between frames, before stepping that frame. Before initialize it
+/// replaces the `gravity` given to [`ppf_cts_set_params`] at once.
+#[no_mangle]
+pub extern "C" fn ppf_cts_set_gravity(ctx: *mut CtsContext, x: f32, y: f32, z: f32) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        ctx.set_gravity([x, y, z])
+    })
+}
+
+/// Set initial vertex velocities (m/s): `3*vertex_count` floats, xyz per
+/// vertex in the same vertex order as [`ppf_cts_set_geometry_ex`].
+/// `vertex_count` must equal that call's vertex count. Call after
+/// [`ppf_cts_set_geometry_ex`] (which clears them) and before
+/// [`ppf_cts_initialize`]; unset velocities are zero. The solver seeds its
+/// previous positions as `x - dt * v`, as the frontend's `vel.bin` does.
+#[no_mangle]
+pub extern "C" fn ppf_cts_set_velocities(
+    ctx: *mut CtsContext,
+    velocities: *const f32,
+    vertex_count: u32,
+) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        if velocities.is_null() || vertex_count == 0 {
+            error::set_last_error("set_velocities: velocities null or empty");
+            return CtsStatus::BadArg;
+        }
+        let velocities = unsafe { slice_f32(velocities, 3 * vertex_count as usize) };
+        ctx.set_velocities(velocities)
     })
 }
 

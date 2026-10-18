@@ -29,6 +29,14 @@ Source: old-ppf-contact-solver a5fdad3. Target base: 6b30976. Nothing committed.
 - Static collider path (`set_collider_ex`) unchanged. No CUDA change; rebuilt with `build-capi-local.bat nocuda`.
 - Tests (CPU, `cargo test -p ppf-cts-capi --features ppf-cts-solver/cpu`): insert_shells layout, keyframed pose, bad keys, pin blend.
 
+## ABI 9: soft pull pins (2026-10-18, uncommitted)
+- `ppf_cts_set_pin_pull(ctx, weights, count)`: one weight per pin in `set_pins` order, before initialize (`set_pins` resets it). As scene.rs `make_constraint`: weight > 0 => `PullPair { position, weight, index, allow_intersection: false }` at the pin's (blended) target position; <= 0 => the exact `FixPair` as before. Pulled pins follow `update_pin_targets` the same way.
+- No CUDA change; rebuilt with `build-capi-local.bat nocuda`. Test: pull_weight_splits_pins_into_pull_and_fix.
+
+## ABI 10: gravity between frames (2026-10-18, uncommitted)
+- `ppf_cts_set_gravity(ctx, x, y, z)`: before initialize it replaces the `set_params` gravity. After initialize it is the value for the next 1/fps boundary: gravity blends linearly in sim time from its current value, like `update_pin_targets`, and `step` writes it into `param.gravity` at each step start (where scene.rs `update_param` samples a `dyn("gravity")` schedule, e.g. examples/hang.ipynb's flip).
+- No CUDA change; rebuilt with `build-capi-local.bat nocuda`. Test: gravity_set_before_init_and_blends_across_the_frame.
+
 ## Notes
 - The solver driver keeps its state in globals (SCENE, SOLVER), so only one live context per process.
 - The capi build passes `--features ppf-cts-solver/cuda` and links libsimbackend_cuda + cudart. For a static plugin, swap cudart.lib for cudart_static.lib and use the build-mt lib dir, as `spike\build.bat static` does.

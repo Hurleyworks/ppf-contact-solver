@@ -26,6 +26,10 @@ pub enum CtsStatus {
     StepFailed = 6,
     /// A Rust panic was caught at the boundary.
     Panic = 7,
+    /// The GPU failed during a step (out of memory, a lost context, a
+    /// failed launch). The process stays alive; the context can only be
+    /// destroyed. [`crate::ppf_cts_last_error`] names the CUDA error.
+    DeviceFault = 8,
 }
 
 thread_local! {

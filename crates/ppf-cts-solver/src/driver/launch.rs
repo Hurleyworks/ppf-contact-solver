@@ -80,6 +80,7 @@ pub type Backend = ppf_cts_compute::abi::AbiDevice;
 /// Pairs with [`Backend`]: a module that needs one asks here rather than
 /// naming a constructor a different arm would not have.
 #[cfg(not(abi_backend_linked))]
+#[allow(dead_code)] // `with_device` opens through `try_backend`
 pub fn backend() -> Backend {
     host_device()
 }
@@ -103,6 +104,7 @@ pub fn try_backend() -> Result<Backend, String> {
 /// and offering one would be the silent-wrong-answer path the seam exists to
 /// close.
 #[cfg(abi_backend_linked)]
+#[allow(dead_code)] // `with_device` opens through `try_backend`
 pub fn backend() -> Backend {
     match try_backend() {
         Ok(device) => device,

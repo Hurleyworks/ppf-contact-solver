@@ -15,7 +15,7 @@ use nalgebra::Matrix3xX;
 use ppf_cts_solver::backend::Backend;
 use ppf_cts_solver::builder::{self, make_collision_mesh};
 use ppf_cts_solver::data::{
-    CollisionMesh, Constraint, DataSet, FaceParam, FaceProp, FixPair, ParamSet, Vec3f,
+    CollisionMesh, Constraint, DataSet, FaceParam, FaceProp, FixPair, ParamSet, PullPair, Vec3f,
     PDRD_BODY_ROW_LEN, ROTATION_LOCK_ALLOW_ONLY, TRANSLATION_LOCK_AXIS,
 };
 use ppf_cts_solver::triutils;
@@ -143,6 +143,10 @@ pub struct CtsContext {
     /// `initialize` (only tet-interior indices move).
     pin_indices: Vec<u32>,
     pin_stiffness: Vec<f32>,
+    /// Per-pin pull weight, aligned with `pin_indices`: `> 0` => a soft
+    /// `PullPair` of that weight toward the pin's position, else an exact
+    /// `FixPair` (as scene.rs `make_constraint`). Empty => every pin is fixed.
+    pin_pull: Vec<f32>,
     /// Per-pin target: `Some` => kinematic (driven to the target),
     /// `None` => fixed at its rest position. Aligned with `pin_indices`.
     pin_targets: Vec<Option<Vec3f>>,
@@ -154,8 +158,18 @@ pub struct CtsContext {
     /// Sim-time span `(t0, t1)` of the current pin segment; `t1 <= t0` means
     /// the target holds at once.
     pin_segment: (f64, f64),
+    /// Gravity pushed by `set_gravity` after initialize: `(from, to)`, blended
+    /// across `gravity_segment` like a pin and written into `param.gravity`
+    /// at each step start (scene.rs `update_param` samples its gravity
+    /// schedule there too). `None` => `param.gravity` as built.
+    gravity_blend: Option<(Vec3f, Vec3f)>,
+    gravity_segment: (f64, f64),
     collider: Option<Collider>,
     animated_colliders: Vec<AnimatedCollider>,
+    /// Initial velocity (m/s), `3*n` in the caller's staged vertex order;
+    /// empty => every vertex starts at rest. Remapped to the merged order at
+    /// `initialize` (shell vertices start at rest).
+    velocities: Vec<f32>,
     /// Granular (SAND) scalar material, `Some` once `set_sand` is called.
     /// Threaded into `Props.sand` at `initialize`; grains are loose
     /// vertices (no incident element) in the staged geometry.
@@ -190,11 +204,15 @@ impl CtsContext {
             geometry: None,
             pin_indices: Vec::new(),
             pin_stiffness: Vec::new(),
+            pin_pull: Vec::new(),
             pin_targets: Vec::new(),
             pin_from: Vec::new(),
             pin_segment: (0.0, 0.0),
+            gravity_blend: None,
+            gravity_segment: (0.0, 0.0),
             collider: None,
             animated_colliders: Vec::new(),
+            velocities: Vec::new(),
             sand: None,
             pdrd_body_rows: Vec::new(),
             pdrd_vert_index: Vec::new(),
@@ -267,6 +285,23 @@ impl CtsContext {
         {
             return CtsStatus::BadArg;
         }
+        // Tets run only the ARAP/StVK/SNHk kernels (Baraff-Witkin on a tet hits
+        // a kernel assert), and need the ranges scene.rs `make_props` asserts.
+        if tet_count > 0 {
+            let mut rows: Vec<usize> = match tet_mat_idx {
+                Some(a) => a.iter().map(|&m| m as usize).collect(),
+                None => vec![0],
+            };
+            rows.sort_unstable();
+            rows.dedup();
+            for row in rows {
+                if let Err(msg) = check_tet_material(&materials[row]) {
+                    set_last_error(format!("set_geometry_ex: tet material row {row}: {msg}"));
+                    return CtsStatus::BadArg;
+                }
+            }
+        }
+        self.velocities.clear();
         self.materials = materials.to_vec();
         self.face_mat_idx = face_mat_idx.map(|a| a.to_vec()).unwrap_or_default();
         self.tet_mat_idx = tet_mat_idx.map(|a| a.to_vec()).unwrap_or_default();
@@ -278,6 +313,29 @@ impl CtsContext {
             rods: rods.to_vec(),
             shell_face_count: shell_face_count.min(face_count),
         });
+        CtsStatus::Ok
+    }
+
+    /// Initial velocity per staged vertex (`3*n`, m/s), in `set_geometry_ex`
+    /// vertex order. Must follow `set_geometry_ex`, which clears it.
+    pub fn set_velocities(&mut self, velocities: &[f32]) -> CtsStatus {
+        if self.initialized {
+            set_last_error("set_velocities called after initialize");
+            return CtsStatus::BadState;
+        }
+        let Some(geometry) = self.geometry.as_ref() else {
+            set_last_error("set_velocities before set_geometry");
+            return CtsStatus::BadState;
+        };
+        if velocities.len() != geometry.verts.len() {
+            set_last_error("set_velocities: vertex_count != set_geometry vertex count");
+            return CtsStatus::BadArg;
+        }
+        if !velocities.iter().all(|v| v.is_finite()) {
+            set_last_error("set_velocities: non-finite component");
+            return CtsStatus::BadArg;
+        }
+        self.velocities = velocities.to_vec();
         CtsStatus::Ok
     }
 
@@ -473,9 +531,28 @@ impl CtsContext {
             None => vec![1.0; indices.len()],
         };
         // Default every pin to fixed at rest until a target arrives.
+        self.pin_pull = Vec::new();
         self.pin_targets = vec![None; indices.len()];
         self.pin_from = vec![None; indices.len()];
         self.pin_segment = (0.0, 0.0);
+        CtsStatus::Ok
+    }
+
+    /// Per-pin pull weights, one per pin in `set_pins` order. A weight `> 0`
+    /// makes that pin a soft `PullPair` of that weight toward its (moving)
+    /// target; `<= 0` keeps it an exact `FixPair`. The solver assigns each
+    /// vertex its fix/pull slot when it builds the scene, so this must come
+    /// before `initialize` (and after `set_pins`, which resets it).
+    pub fn set_pin_pull(&mut self, weights: &[f32]) -> CtsStatus {
+        if self.initialized {
+            set_last_error("set_pin_pull called after initialize");
+            return CtsStatus::BadState;
+        }
+        if weights.len() != self.pin_indices.len() {
+            set_last_error("set_pin_pull: weight count != pin count");
+            return CtsStatus::BadArg;
+        }
+        self.pin_pull = weights.to_vec();
         CtsStatus::Ok
     }
 
@@ -513,6 +590,36 @@ impl CtsContext {
         CtsStatus::Ok
     }
 
+    /// Set gravity for the NEXT frame boundary. After `initialize` it blends
+    /// linearly in sim time from its current value to `gravity`, reached at
+    /// the next multiple of `1/fps`, as `update_pin_targets` does; the
+    /// solver reads it at each step start. Before `initialize` it replaces
+    /// the `set_params` gravity at once.
+    pub fn set_gravity(&mut self, gravity: [f32; 3]) -> CtsStatus {
+        if !gravity.iter().all(|g| g.is_finite()) {
+            set_last_error("set_gravity: non-finite component");
+            return CtsStatus::BadArg;
+        }
+        let target = Vec3f::new(gravity[0], gravity[1], gravity[2]);
+        if !self.initialized {
+            self.sim_args.gravity = gravity;
+            return CtsStatus::Ok;
+        }
+        let now = self.backend.as_ref().unwrap().state.time;
+        let from = self.gravity_at(now);
+        self.gravity_blend = Some((from, target));
+        self.gravity_segment = (now, next_frame_time(now, self.sim_args.fps));
+        CtsStatus::Ok
+    }
+
+    /// Gravity at sim time `time` (after initialize).
+    fn gravity_at(&self, time: f64) -> Vec3f {
+        match self.gravity_blend {
+            Some((from, to)) => pin_blend(from, to, self.gravity_segment, time),
+            None => self.param.as_ref().unwrap().gravity,
+        }
+    }
+
     /// Build the pin constraint for the step from `prev_time` to `time` (the
     /// driver's `make_constraint(state.time + dt, state.time)`). Caller pins
     /// take their (interpolated) target or rest position; every animated
@@ -523,13 +630,26 @@ impl CtsContext {
     ///
     /// Since ABI 6 every pin is an exact Dirichlet condition (the solver
     /// eliminates the DOF), so the per-pin stiffness staged by `set_pins` is
-    /// accepted but no longer used.
+    /// accepted but no longer used. A pin with a pull weight `> 0`
+    /// (`set_pin_pull`) is a soft `PullPair` toward the same position
+    /// instead, as scene.rs `make_constraint` does.
     fn build_constraint(&self, rest_vertex: &Matrix3xX<f32>, time: f64, prev_time: f64) -> Constraint {
         let ghat = self.sim_args.constraint_ghat;
         let mut fix = Vec::with_capacity(self.pin_indices.len());
+        let mut pull = Vec::new();
         for (i, &idx) in self.pin_indices.iter().enumerate() {
             let kinematic = self.pin_targets[i].is_some();
             let position = self.pin_position(i, time, rest_vertex);
+            let weight = self.pin_pull.get(i).copied().unwrap_or(0.0);
+            if weight > 0.0 {
+                pull.push(PullPair {
+                    position,
+                    index: idx,
+                    weight,
+                    allow_intersection: false,
+                });
+                continue;
+            }
             let step_delta = if kinematic {
                 position - self.pin_position(i, prev_time, rest_vertex)
             } else {
@@ -563,7 +683,7 @@ impl CtsContext {
         };
         Constraint {
             fix: CVec::from(&fix[..]),
-            pull: CVec::new(),
+            pull: CVec::from(&pull[..]),
             torque_groups: CVec::new(),
             torque_vertices: CVec::new(),
             sphere: CVec::new(),
@@ -664,6 +784,14 @@ impl CtsContext {
         // shells sit right after them, so that is the first `insert` verts.
         let cloth_surface_vert_count = merged.insert as u32;
 
+        // Initial velocity in the merged order (scene.rs `vel.bin`); `build`
+        // seeds the previous positions as `x - dt * v`.
+        let mut velocity = Matrix3xX::<f32>::zeros(merged.verts.len() / 3);
+        for (i, v) in self.velocities.chunks_exact(3).enumerate() {
+            let col = merged.remap(i as u32) as usize;
+            velocity.set_column(col, &Vec3f::new(v[0], v[1], v[2]));
+        }
+
         let meshset = ingest::build_meshset(
             &merged.verts,
             &merged.faces,
@@ -701,7 +829,6 @@ impl CtsContext {
         props.sand = self.sand;
         let constraint = self.build_constraint(&meshset.vertex, 0.0, 0.0);
 
-        let velocity = Matrix3xX::<f32>::zeros(nv);
         let pdrd = builder::PdrdSceneData {
             body_rows: &self.pdrd_body_rows,
             vert_index: &self.pdrd_vert_index,
@@ -777,6 +904,10 @@ impl CtsContext {
         // Build the constraint while holding only an immutable borrow of
         // the backend (for the rest vertices), then drop it before the
         // mutable step borrow below.
+        if self.gravity_blend.is_some() {
+            let gravity = self.gravity_at(self.backend.as_ref().unwrap().state.time);
+            self.param.as_mut().unwrap().gravity = gravity;
+        }
         let constraint = {
             let backend = self.backend.as_ref().unwrap();
             let param = self.param.as_ref().unwrap();
@@ -787,6 +918,14 @@ impl CtsContext {
         let dataset = self.dataset.as_ref().unwrap();
         let param = self.param.as_ref().unwrap();
         let result = backend.step_in_memory(dataset, param, &constraint);
+        // A GPU FAILURE IS RECORDED, NOT EXITED ON (soft mode, enabled by
+        // `ppf_cts_create`). The device is lost, so this context is done; the
+        // next `initialize` of a new context reopens it.
+        if ppf_cts_solver::driver::fatal_code() != 0 {
+            self.initialized = false;
+            set_last_error(device_fault_message());
+            return CtsStatus::DeviceFault;
+        }
         if !result.success() {
             set_last_error("solver step failed (CCD/PCG/intersection)");
             return CtsStatus::StepFailed;
@@ -829,6 +968,24 @@ impl CtsContext {
     }
 }
 
+/// A material row a tet may use: a solid model and the ranges scene.rs
+/// `make_props` asserts for tets.
+fn check_tet_material(m: &CtsMaterial) -> Result<(), &'static str> {
+    if !matches!(m.model, CtsModel::Arap | CtsModel::StVK | CtsModel::SNHk) {
+        return Err("model must be ARAP, StVK or SNHk (Baraff-Witkin is shell-only)");
+    }
+    if !(m.young_modulus > 0.0) || !m.young_modulus.is_finite() {
+        return Err("young_modulus must be positive");
+    }
+    if !(m.poisson_ratio > 0.0 && m.poisson_ratio < 0.5) {
+        return Err("poisson_ratio must be in (0, 0.5)");
+    }
+    if !(m.density > 0.0) || !m.density.is_finite() {
+        return Err("density must be positive");
+    }
+    Ok(())
+}
+
 /// The first multiple of `1/fps` strictly after `now` (a hair of slack so a
 /// step that lands a rounding error short of a frame counts as on it).
 fn next_frame_time(now: f64, fps: f64) -> f64 {
@@ -852,6 +1009,27 @@ fn pin_blend(from: Vec3f, target: Vec3f, segment: (f64, f64), time: f64) -> Vec3
     from + (target - from) * s
 }
 
+/// The driver's recorded fatal as a one-line message. The detail is wrapped
+/// in the driver's and the seam's context; when it carries the CUDA
+/// backend's own message ("CUDA out of memory: ..."), that part is what a user
+/// can act on, so it is returned alone.
+fn device_fault_message() -> String {
+    let raw = ppf_cts_solver::driver::fatal_detail();
+    let detail = if raw.is_null() {
+        String::new()
+    } else {
+        // Safety: the driver hands out a NUL-terminated, process-lived buffer.
+        unsafe { std::ffi::CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    match detail.find("CUDA ") {
+        Some(at) => detail[at..].to_string(),
+        None if detail.is_empty() => "GPU device fault during the step".to_string(),
+        None => detail,
+    }
+}
+
 impl Default for CtsContext {
     fn default() -> Self {
         Self::new()
@@ -861,6 +1039,27 @@ impl Default for CtsContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pull_weight_splits_pins_into_pull_and_fix() {
+        let mut ctx = CtsContext::new();
+        assert!(matches!(ctx.set_pins(&[0, 1], None), CtsStatus::Ok));
+        assert!(matches!(ctx.set_pin_pull(&[0.5]), CtsStatus::BadArg));
+        assert!(matches!(ctx.set_pin_pull(&[0.0, 0.5]), CtsStatus::Ok));
+        let targets = [1.0f32, 0.0, 0.0, 2.0, 3.0, 4.0];
+        assert!(matches!(ctx.update_pin_targets(&targets), CtsStatus::Ok));
+        let rest = Matrix3xX::<f32>::zeros(2);
+        let c = ctx.build_constraint(&rest, 0.1, 0.0);
+        let fix: Vec<FixPair> = c.fix.iter().copied().collect();
+        let pull: Vec<PullPair> = c.pull.iter().copied().collect();
+        assert_eq!(fix.len(), 1);
+        assert_eq!(pull.len(), 1);
+        assert_eq!(fix[0].index, 0);
+        let p = pull[0];
+        assert_eq!(p.index, 1);
+        assert_eq!(p.weight, 0.5);
+        assert!((p.position - Vec3f::new(2.0, 3.0, 4.0)).norm() < 1e-6);
+    }
 
     #[test]
     fn keyframed_collider_moves_rotates_and_holds() {
@@ -920,5 +1119,122 @@ mod tests {
         // error short of frame 1 still counts as frame 1.
         assert!((next_frame_time(0.05, 24.0) - 2.0 / 24.0).abs() < 1e-12);
         assert!((next_frame_time(1.0 / 24.0 - 1e-12, 24.0) - 2.0 / 24.0).abs() < 1e-12);
+    }
+
+    /// One tet (corner at the origin, edges 0.1 m) with its four boundary
+    /// faces as contact-only faces (`shell_face_count` 0).
+    const TET_VERTS: [f32; 12] = [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1];
+    const TET_FACES: [u32; 12] = [0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3];
+    const TET: [u32; 4] = [0, 1, 2, 3];
+
+    fn last_error_text() -> String {
+        let ptr = crate::error::last_error_ptr();
+        unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    }
+
+    fn solid(model: CtsModel) -> CtsMaterial {
+        CtsMaterial {
+            model,
+            young_modulus: 500.0,
+            poisson_ratio: 0.35,
+            density: 100.0,
+            ..CtsMaterial::default()
+        }
+    }
+
+    fn stage_tet(ctx: &mut CtsContext, mats: &[CtsMaterial], tet_idx: Option<&[u32]>) -> CtsStatus {
+        ctx.set_geometry_ex(&TET_VERTS, &TET_FACES, &TET, &[], 0, mats, None, tet_idx, None)
+    }
+
+    #[test]
+    fn tet_rows_must_be_solid_materials() {
+        let mut ctx = CtsContext::new();
+        // Baraff-Witkin (the default row) on a tet is rejected.
+        assert!(matches!(stage_tet(&mut ctx, &[CtsMaterial::default()], None), CtsStatus::BadArg));
+        assert!(last_error_text().contains("Baraff-Witkin"));
+        // A BW row is fine for faces when the tet selects a solid row.
+        let mats = [CtsMaterial::default(), solid(CtsModel::Arap)];
+        assert!(matches!(stage_tet(&mut ctx, &mats, Some(&[1])), CtsStatus::Ok));
+        for model in [CtsModel::Arap, CtsModel::StVK, CtsModel::SNHk] {
+            assert!(matches!(stage_tet(&mut ctx, &[solid(model)], None), CtsStatus::Ok));
+        }
+        let bad = |f: fn(&mut CtsMaterial)| {
+            let mut m = solid(CtsModel::Arap);
+            f(&mut m);
+            m
+        };
+        for m in [
+            bad(|m| m.young_modulus = 0.0),
+            bad(|m| m.poisson_ratio = 0.5),
+            bad(|m| m.poisson_ratio = 0.0),
+            bad(|m| m.density = -1.0),
+        ] {
+            assert!(matches!(stage_tet(&mut CtsContext::new(), &[m], None), CtsStatus::BadArg));
+        }
+    }
+
+    #[test]
+    fn velocities_need_geometry_and_matching_count() {
+        let mut ctx = CtsContext::new();
+        let v = [0.0f32; 12];
+        assert!(matches!(ctx.set_velocities(&v), CtsStatus::BadState));
+        assert!(matches!(stage_tet(&mut ctx, &[solid(CtsModel::Arap)], None), CtsStatus::Ok));
+        assert!(matches!(ctx.set_velocities(&v[..9]), CtsStatus::BadArg));
+        assert!(matches!(ctx.set_velocities(&v), CtsStatus::Ok));
+        assert_eq!(ctx.velocities.len(), 12);
+        // Restaging geometry clears them.
+        assert!(matches!(stage_tet(&mut ctx, &[solid(CtsModel::Arap)], None), CtsStatus::Ok));
+        assert!(ctx.velocities.is_empty());
+    }
+
+    /// One ARAP tet, no gravity, no air: moves by v * t. Needs a GPU backend
+    /// (`--features ppf-cts-solver/cuda`); skipped on a build without one.
+    #[test]
+    fn tet_with_initial_velocity_moves_by_v_t() {
+        if ppf_cts_solver::linked_backend_name().is_none() {
+            eprintln!("skipped: no GPU backend linked");
+            return;
+        }
+        let mut ctx = CtsContext::new();
+        let params = CtsGlobalParams {
+            gravity: [0.0; 3],
+            air_density: 0.0,
+            air_friction: 0.0,
+            ..CtsGlobalParams::default()
+        };
+        assert!(matches!(ctx.set_params(&params), CtsStatus::Ok));
+        assert!(matches!(stage_tet(&mut ctx, &[solid(CtsModel::Arap)], None), CtsStatus::Ok));
+        let v = [1.0f32, 0.0, -0.5];
+        let vel: Vec<f32> = (0..4).flat_map(|_| v).collect();
+        assert!(matches!(ctx.set_velocities(&vel), CtsStatus::Ok));
+        assert!(matches!(ctx.initialize(), CtsStatus::Ok), "{}", last_error_text());
+        let mut time = 0.0;
+        for _ in 0..20 {
+            assert!(matches!(ctx.step(Some(&mut time)), CtsStatus::Ok));
+        }
+        let mut out = [0.0f32; 12];
+        assert!(matches!(ctx.read_positions(&mut out), CtsStatus::Ok));
+        assert!(time > 0.0);
+        for i in 0..4 {
+            for a in 0..3 {
+                let moved = out[3 * i + a] - TET_VERTS[3 * i + a];
+                let expect = v[a] * time as f32;
+                assert!((moved - expect).abs() < 1e-3 + 0.02 * expect.abs(), "vertex {i} axis {a}: moved {moved}, expected {expect}");
+            }
+        }
+    }
+
+    #[test]
+    fn gravity_set_before_init_and_blends_across_the_frame() {
+        let mut ctx = CtsContext::new();
+        assert!(matches!(ctx.set_gravity([0.0, f32::NAN, 0.0]), CtsStatus::BadArg));
+        assert!(matches!(ctx.set_gravity([0.0, 9.8, 0.0]), CtsStatus::Ok));
+        assert_eq!(ctx.sim_args.gravity, [0.0, 9.8, 0.0]);
+        // After initialize: flip from -9.8 to +9.8 over the frame 0.1..0.2 s.
+        ctx.gravity_blend = Some((Vec3f::new(0.0, -9.8, 0.0), Vec3f::new(0.0, 9.8, 0.0)));
+        ctx.gravity_segment = (0.1, 0.2);
+        assert!(ctx.gravity_at(0.15)[1].abs() < 1e-5);
+        assert_eq!(ctx.gravity_at(0.05)[1], -9.8);
+        assert_eq!(ctx.gravity_at(0.3)[1], 9.8);
     }
 }

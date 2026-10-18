@@ -178,7 +178,38 @@ bool open_arena(Allocator *allocator, u64 need, std::string *error) {
     }
 
     Arena arena;
-    CUDA_HANDLE_ERROR(cudaMalloc(&arena.base, reserve));
+    // CHECKED HERE RATHER THAN THROUGH CUDA_HANDLE_ERROR, because a device
+    // that is out of memory (another program can take it mid-solve) is a
+    // refusal the caller can report, not a reason to end the process. A failed
+    // cudaMalloc leaves the context usable; its error is cleared so the next
+    // launch check does not mistake it for its own.
+    const cudaError_t malloc_code = cudaMalloc(&arena.base, reserve);
+    if (malloc_code != cudaSuccess) {
+        (void)cudaGetLastError();
+        char message[256];
+        size_t free_bytes = 0, total_bytes = 0;
+        if (malloc_code != cudaErrorMemoryAllocation) {
+            snprintf(message, sizeof(message),
+                     "CUDA error: %s (%s) reserving %llu MB",
+                     cudaGetErrorString(malloc_code),
+                     cudaGetErrorName(malloc_code),
+                     (unsigned long long)(reserve >> 20));
+        } else if (cudaMemGetInfo(&free_bytes, &total_bytes) ==
+                   cudaSuccess) {
+            snprintf(message, sizeof(message),
+                     "CUDA out of memory: %llu MB free of %llu MB on the "
+                     "device, %llu MB requested",
+                     (unsigned long long)(free_bytes >> 20),
+                     (unsigned long long)(total_bytes >> 20),
+                     (unsigned long long)(reserve >> 20));
+        } else {
+            snprintf(message, sizeof(message),
+                     "CUDA out of memory: %s, %llu MB requested",
+                     cudaGetErrorString(malloc_code),
+                     (unsigned long long)(reserve >> 20));
+        }
+        return fail(error, message);
+    }
     arena.capacity = reserve;
     const unsigned index = static_cast<unsigned>(allocator->arenas.size());
     CUDA_HANDLE_ERROR(cudaMemcpyToSymbol(

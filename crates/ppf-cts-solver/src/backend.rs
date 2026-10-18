@@ -28,6 +28,7 @@ use std::time::Instant;
 // declaration is unconditional.
 extern "C" {
     fn advance(result: *mut StepResult);
+    fn fatal_code() -> u8;
     fn fetch();
     fn fetch_inv_rest();
     fn fetch_rest_angles();
@@ -440,11 +441,19 @@ impl Backend {
         param: &ParamSet,
         constraint: &Constraint,
     ) -> StepResult {
-        unsafe {
-            update_constraint(constraint);
-            refresh_collision_active(self.state.time as f32);
-        }
         let mut result = StepResult::default();
+        // In the driver's soft mode a failed entry point records a fatal and
+        // returns, so each later one is skipped once `fatal_code()` is set: the
+        // device it would reach is already lost.
+        // A default `StepResult` reports no progress, so it reads as failed.
+        unsafe { update_constraint(constraint) };
+        if unsafe { fatal_code() } != 0 {
+            return result;
+        }
+        unsafe { refresh_collision_active(self.state.time as f32) };
+        if unsafe { fatal_code() } != 0 {
+            return result;
+        }
         unsafe { advance(&mut result) };
         if result.success() {
             self.state.time = result.time;
