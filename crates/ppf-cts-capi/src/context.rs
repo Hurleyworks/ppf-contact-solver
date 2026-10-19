@@ -15,8 +15,8 @@ use nalgebra::Matrix3xX;
 use ppf_cts_solver::backend::Backend;
 use ppf_cts_solver::builder::{self, make_collision_mesh};
 use ppf_cts_solver::data::{
-    CollisionMesh, Constraint, DataSet, FaceParam, FaceProp, FixPair, ParamSet, PullPair, Vec3f,
-    PDRD_BODY_ROW_LEN, ROTATION_LOCK_ALLOW_ONLY, TRANSLATION_LOCK_AXIS,
+    CollisionMesh, Constraint, DataSet, FaceParam, FaceProp, FixPair, ParamSet, PullPair, Stitch,
+    Vec3f, Vec6f, Vec6u, PDRD_BODY_ROW_LEN, ROTATION_LOCK_ALLOW_ONLY, TRANSLATION_LOCK_AXIS,
 };
 use ppf_cts_solver::triutils;
 use ppf_cts_solver::{CVec, SimArgs};
@@ -170,6 +170,18 @@ pub struct CtsContext {
     /// schedule there too). `None` => `param.gravity` as built.
     gravity_blend: Option<(Vec3f, Vec3f)>,
     gravity_segment: (f64, f64),
+    /// Cross-stitches (`set_stitches`), 6-wide, in the caller's vertex
+    /// numbering until `initialize` remaps them to the merged order as it
+    /// does pins. The same set goes into every step's constraint: the solver
+    /// registers each stitch's sparsity at build, so the count is fixed then.
+    stitches: Vec<Stitch>,
+    /// `set_settle`: `(until_time, settle_dt, settle_inactive_momentum)`.
+    /// While a step starts before `until_time` it runs with the settle dt and
+    /// inactive momentum; after, with `normal_step`. `None` => off.
+    settle: Option<(f64, f32, bool)>,
+    /// The built `param.dt` / `param.inactive_momentum`, captured at
+    /// `initialize`, restored once the settle window ends.
+    normal_step: (f32, bool),
     collider: Option<Collider>,
     animated_colliders: Vec<AnimatedCollider>,
     /// Initial velocity (m/s), `3*n` in the caller's staged vertex order;
@@ -217,6 +229,9 @@ impl CtsContext {
             pin_segment: (0.0, 0.0),
             gravity_blend: None,
             gravity_segment: (0.0, 0.0),
+            stitches: Vec::new(),
+            settle: None,
+            normal_step: (0.0, false),
             collider: None,
             animated_colliders: Vec::new(),
             velocities: Vec::new(),
@@ -582,6 +597,70 @@ impl CtsContext {
         CtsStatus::Ok
     }
 
+    /// Append cross-stitches: `ind`/`w` are 6 per stitch, `[s0,s1,s2,t0,t1,t2]`
+    /// indices in the caller's geometry numbering and their barycentric
+    /// weights (source side then target side), all sharing `stiffness`.
+    /// An empty call clears every staged stitch. Index range is checked at
+    /// `initialize`, where the geometry is final.
+    pub fn set_stitches(&mut self, ind: &[u32], w: &[f32], stiffness: f32) -> CtsStatus {
+        if self.initialized {
+            set_last_error("set_stitches called after initialize");
+            return CtsStatus::BadState;
+        }
+        if ind.len() != w.len() || ind.len() % 6 != 0 {
+            set_last_error("set_stitches: index/weight arrays must both be 6 * count");
+            return CtsStatus::BadArg;
+        }
+        if ind.is_empty() {
+            self.stitches.clear();
+            return CtsStatus::Ok;
+        }
+        if !(stiffness >= 0.0) || !stiffness.is_finite() {
+            set_last_error("set_stitches: stiffness must be finite and non-negative");
+            return CtsStatus::BadArg;
+        }
+        if !w.iter().all(|x| x.is_finite()) {
+            set_last_error("set_stitches: non-finite weight");
+            return CtsStatus::BadArg;
+        }
+        for (i, wt) in ind.chunks_exact(6).zip(w.chunks_exact(6)) {
+            self.stitches.push(Stitch {
+                index: Vec6u::from_column_slice(i),
+                weight: Vec6f::from_column_slice(wt),
+                stiffness,
+            });
+        }
+        CtsStatus::Ok
+    }
+
+    /// Settle window: while a step starts before `until_time` (sim seconds) it
+    /// uses `settle_dt` and `settle_inactive_momentum`; from then on the
+    /// `set_params` dt and inactive momentum. `until_time <= 0` turns it off.
+    /// Valid before or after `initialize` (after: from the next step).
+    pub fn set_settle(&mut self, until_time: f64, settle_dt: f32, settle_inactive_momentum: bool) -> CtsStatus {
+        if !(until_time > 0.0) {
+            self.settle = None;
+            return CtsStatus::Ok;
+        }
+        if !until_time.is_finite() || !(settle_dt > 0.0) || !settle_dt.is_finite() {
+            set_last_error("set_settle: until_time must be finite, settle_dt positive and finite");
+            return CtsStatus::BadArg;
+        }
+        // Same clamp `builder::make_param` applies to dt: under one frame.
+        let fps = self.sim_args.fps;
+        let settle_dt = if fps > 0.0 { settle_dt.min(0.9999 / fps as f32) } else { settle_dt };
+        self.settle = Some((until_time, settle_dt, settle_inactive_momentum));
+        CtsStatus::Ok
+    }
+
+    /// dt and inactive momentum for a step starting at `start`.
+    fn step_dt(&self, start: f64) -> (f32, bool) {
+        match self.settle {
+            Some((until, dt, momentum)) if start < until => (dt, momentum),
+            _ => self.normal_step,
+        }
+    }
+
     /// Whether caller pin `i` has been released by sim time `time`.
     fn pin_released(&self, i: usize, time: f64) -> bool {
         match self.pin_release.get(i) {
@@ -726,7 +805,7 @@ impl CtsContext {
             torque_vertices: CVec::new(),
             sphere: CVec::new(),
             floor: CVec::new(),
-            stitch: CVec::new(),
+            stitch: CVec::from(&self.stitches[..]),
             mesh,
         }
     }
@@ -771,6 +850,14 @@ impl CtsContext {
             set_last_error("set_pins: pin index >= vertex count");
             return CtsStatus::BadArg;
         }
+        if self
+            .stitches
+            .iter()
+            .any(|s| s.index.iter().any(|&v| v as usize >= staged_vertex_count))
+        {
+            set_last_error("set_stitches: stitch index >= vertex count");
+            return CtsStatus::BadArg;
+        }
 
         // Splice the animated-collider pin shells in after the caller's
         // contact vertices / shell faces, each with its own material row.
@@ -810,6 +897,11 @@ impl CtsContext {
         }
         for p in self.pin_indices.iter_mut() {
             *p = merged.remap(*p);
+        }
+        for s in self.stitches.iter_mut() {
+            for v in s.index.iter_mut() {
+                *v = merged.remap(*v);
+            }
         }
         if !self.pdrd_vert_index.is_empty() {
             let insert = merged.insert;
@@ -912,6 +1004,7 @@ impl CtsContext {
         // because `param` lives on its stack for the entire step loop.)
         self.param = Some(builder::make_param(&self.sim_args));
         let param = self.param.as_ref().unwrap();
+        self.normal_step = (param.dt, param.inactive_momentum);
 
         // `build` borrowed `meshset`; those borrows are done, so move it
         // into the backend now (it owns the rest mesh for `read_positions`
@@ -945,6 +1038,15 @@ impl CtsContext {
         if self.gravity_blend.is_some() {
             let gravity = self.gravity_at(self.backend.as_ref().unwrap().state.time);
             self.param.as_mut().unwrap().gravity = gravity;
+        }
+        {
+            // Settle window or the built values. The driver scales its
+            // velocity predictor by dt / prev_dt, so a dt change between
+            // steps is safe (scene.rs's `dt` schedule does the same).
+            let (dt, momentum) = self.step_dt(self.backend.as_ref().unwrap().state.time);
+            let param = self.param.as_mut().unwrap();
+            param.dt = dt;
+            param.inactive_momentum = momentum;
         }
         let constraint = {
             let backend = self.backend.as_ref().unwrap();
@@ -1277,6 +1379,75 @@ mod tests {
                 assert!((moved - expect).abs() < 1e-3 + 0.02 * expect.abs(), "vertex {i} axis {a}: moved {moved}, expected {expect}");
             }
         }
+    }
+
+    #[test]
+    fn stitches_validate_and_settle_picks_the_step_dt() {
+        let mut ctx = CtsContext::new();
+        let ind = [0u32, 0, 0, 3, 3, 3];
+        let w = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+        assert!(matches!(ctx.set_stitches(&ind[..5], &w[..5], 1.0), CtsStatus::BadArg));
+        assert!(matches!(ctx.set_stitches(&ind, &w, -1.0), CtsStatus::BadArg));
+        assert!(matches!(ctx.set_stitches(&ind, &w, 1.0), CtsStatus::Ok));
+        assert!(matches!(ctx.set_stitches(&ind, &w, 2.0), CtsStatus::Ok));
+        let rest = Matrix3xX::<f32>::zeros(4);
+        let c = ctx.build_constraint(&rest, 0.1, 0.0);
+        let st: Vec<Stitch> = c.stitch.iter().copied().collect();
+        assert_eq!(st.len(), 2);
+        assert_eq!(st[1].stiffness, 2.0);
+        assert_eq!(st[0].index[3], 3);
+        assert!(matches!(ctx.set_stitches(&[], &[], 0.0), CtsStatus::Ok));
+        assert!(ctx.stitches.is_empty());
+
+        ctx.normal_step = (1e-3, false);
+        assert!(matches!(ctx.set_settle(0.5, 0.01, true), CtsStatus::Ok));
+        assert_eq!(ctx.step_dt(0.49), (0.01, true));
+        assert_eq!(ctx.step_dt(0.5), (1e-3, false));
+        assert!(matches!(ctx.set_settle(0.5, 0.0, true), CtsStatus::BadArg));
+        assert!(matches!(ctx.set_settle(0.0, 0.0, true), CtsStatus::Ok));
+        assert_eq!(ctx.step_dt(0.0), (1e-3, false));
+    }
+
+    /// Two loose triangles 5 cm apart, one vertex-to-vertex stitch, no
+    /// gravity: the stitch pulls the gap closed. Needs a GPU backend.
+    #[test]
+    fn stitch_closes_the_gap() {
+        if ppf_cts_solver::linked_backend_name().is_none() {
+            eprintln!("skipped: no GPU backend linked");
+            return;
+        }
+        let mut ctx = CtsContext::new();
+        let params = CtsGlobalParams {
+            gravity: [0.0; 3],
+            air_density: 0.0,
+            air_friction: 0.0,
+            ..CtsGlobalParams::default()
+        };
+        assert!(matches!(ctx.set_params(&params), CtsStatus::Ok));
+        let verts = [
+            0.0f32, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1, 0.0, //
+            0.0, 0.0, 0.05, 0.1, 0.0, 0.05, 0.0, 0.1, 0.05,
+        ];
+        let faces = [0u32, 1, 2, 3, 4, 5];
+        let status = ctx.set_geometry_ex(&verts, &faces, &[], &[], 2, &[CtsMaterial::default()], None, None, None);
+        assert!(matches!(status, CtsStatus::Ok));
+        let ind = [0u32, 0, 0, 3, 3, 3];
+        let w = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+        assert!(matches!(ctx.set_stitches(&ind, &w, 1.0), CtsStatus::Ok));
+        assert!(matches!(ctx.initialize(), CtsStatus::Ok), "{}", last_error_text());
+        let gap = |ctx: &CtsContext| {
+            let mut out = [0.0f32; 18];
+            assert!(matches!(ctx.read_positions(&mut out), CtsStatus::Ok));
+            let d: f32 = (0..3).map(|a| (out[a] - out[9 + a]).powi(2)).sum();
+            d.sqrt()
+        };
+        let mut time = 0.0;
+        for _ in 0..200 {
+            assert!(matches!(ctx.step(Some(&mut time)), CtsStatus::Ok), "{}", last_error_text());
+        }
+        let end = gap(&ctx);
+        eprintln!("stitch gap after {time:.3} s: {end}");
+        assert!(end < 0.01, "gap {end} did not close");
     }
 
     #[test]

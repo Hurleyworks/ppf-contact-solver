@@ -102,6 +102,8 @@ pub struct CtsGlobalParams {
     pub friction_eps: f32,
     pub csrmat_max_nnz: u32,
     pub playback: f32,
+    /// Ignored: stitch stiffness is per `ppf_cts_set_stitches` call. Kept so
+    /// the struct layout is unchanged.
     pub stitch_stiffness: f32,
     pub stitch_length_factor: f32,
     pub fix_xz: f32,

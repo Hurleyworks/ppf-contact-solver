@@ -126,6 +126,10 @@ typedef struct CtsGlobalParams {
     float friction_eps;
     uint32_t csrmat_max_nnz;
     float playback;
+    /**
+     * Ignored: stitch stiffness is per `ppf_cts_set_stitches` call. Kept so
+     * the struct layout is unchanged.
+     */
     float stitch_stiffness;
     float stitch_length_factor;
     float fix_xz;
@@ -426,6 +430,42 @@ enum CtsStatus ppf_cts_set_gravity(struct CtsContext *ctx, float x, float y, flo
 enum CtsStatus ppf_cts_set_velocities(struct CtsContext *ctx,
                                       const float *velocities,
                                       uint32_t vertex_count);
+
+/**
+ * Append `count` cross-stitches, all with `stiffness` (>= 0, the frontend's
+ * per-object `stitch-stiffness`, typically 1.0). Each stitch is 6 indices and
+ * 6 weights: `[s0, s1, s2, t0, t1, t2]`, a barycentric point on the source
+ * side (slots 0..2) pulled to one on the target side (slots 3..5); weights
+ * on each side sum to 1. A vertex-to-triangle stitch is
+ * `ind = [v, v, v, a, b, c]`, `w = [1, 0, 0, wa, wb, wc]`; vertex-to-edge
+ * `[v, v, v, a, b, b]` / `[1, 0, 0, 1 - u, u, 0]`; vertex-to-vertex
+ * `[v, v, v, u, u, u]` / `[1, 0, 0, 1, 0, 0]`. The spring's rest length is
+ * the mean of the two sides' contact gaps; its pull saturates beyond
+ * `stitch_length_factor * rest + contact offsets`. Indices are in the
+ * [`ppf_cts_set_geometry_ex`] vertex numbering (remapped at initialize like
+ * pins). Calls append (e.g. one per body); `count` 0 clears every staged
+ * stitch. Before [`ppf_cts_initialize`] only: the solver fixes the stitch
+ * set's sparsity at build, and every step carries the same set.
+ */
+enum CtsStatus ppf_cts_set_stitches(struct CtsContext *ctx,
+                                    const uint32_t *ind,
+                                    const float *w,
+                                    uint32_t count,
+                                    float stiffness);
+
+/**
+ * Settle window: every step that STARTS before `until_time` (sim seconds)
+ * runs with `settle_dt` (clamped under one frame, as `dt` is) and
+ * `settle_inactive_momentum` (0/1); later steps use the [`ppf_cts_set_params`]
+ * `dt` and `inactive_momentum`. `until_time <= 0` turns it off. Callable
+ * before or after [`ppf_cts_initialize`] (after: from the next step). Frame
+ * timing is unaffected (step until the returned sim time reaches each frame);
+ * the last settle step may run past `until_time` by up to `settle_dt`.
+ */
+enum CtsStatus ppf_cts_set_settle(struct CtsContext *ctx,
+                                  double until_time,
+                                  float settle_dt,
+                                  int32_t settle_inactive_momentum);
 
 /**
  * Stage SAND granular material. Every grain is a loose vertex (no

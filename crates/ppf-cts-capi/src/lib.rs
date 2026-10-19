@@ -61,7 +61,11 @@ use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 ///    are unchanged.
 /// 14: `CtsMaterial` gains a trailing `length_factor` (rod rest-length
 ///    factor, default 1.0; rods only). Struct layout CHANGED.
-const ABI_VERSION: u32 = 14;
+/// 15: adds `ppf_cts_set_stitches` (cross-stitches, 6-wide barycentric rows)
+///    and `ppf_cts_set_settle` (a settle window with its own dt and inactive
+///    momentum). `CtsGlobalParams.stitch_stiffness` stays ignored (stiffness
+///    comes per `ppf_cts_set_stitches` call). Struct layouts are unchanged.
+const ABI_VERSION: u32 = 15;
 
 /// Current C ABI version. Callers compare against their compiled header.
 #[no_mangle]
@@ -606,6 +610,65 @@ pub extern "C" fn ppf_cts_set_velocities(
         }
         let velocities = unsafe { slice_f32(velocities, 3 * vertex_count as usize) };
         ctx.set_velocities(velocities)
+    })
+}
+
+/// Append `count` cross-stitches, all with `stiffness` (>= 0, the frontend's
+/// per-object `stitch-stiffness`, typically 1.0). Each stitch is 6 indices and
+/// 6 weights: `[s0, s1, s2, t0, t1, t2]`, a barycentric point on the source
+/// side (slots 0..2) pulled to one on the target side (slots 3..5); weights
+/// on each side sum to 1. A vertex-to-triangle stitch is
+/// `ind = [v, v, v, a, b, c]`, `w = [1, 0, 0, wa, wb, wc]`; vertex-to-edge
+/// `[v, v, v, a, b, b]` / `[1, 0, 0, 1 - u, u, 0]`; vertex-to-vertex
+/// `[v, v, v, u, u, u]` / `[1, 0, 0, 1, 0, 0]`. The spring's rest length is
+/// the mean of the two sides' contact gaps; its pull saturates beyond
+/// `stitch_length_factor * rest + contact offsets`. Indices are in the
+/// [`ppf_cts_set_geometry_ex`] vertex numbering (remapped at initialize like
+/// pins). Calls append (e.g. one per body); `count` 0 clears every staged
+/// stitch. Before [`ppf_cts_initialize`] only: the solver fixes the stitch
+/// set's sparsity at build, and every step carries the same set.
+#[no_mangle]
+pub extern "C" fn ppf_cts_set_stitches(
+    ctx: *mut CtsContext,
+    ind: *const u32,
+    w: *const f32,
+    count: u32,
+    stiffness: f32,
+) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        if (ind.is_null() || w.is_null()) && count != 0 {
+            error::set_last_error("set_stitches: null arrays with non-zero count");
+            return CtsStatus::BadArg;
+        }
+        let n = 6 * count as usize;
+        let ind = unsafe { slice_u32(ind, n) };
+        let w = unsafe { slice_f32(w, n) };
+        ctx.set_stitches(ind, w, stiffness)
+    })
+}
+
+/// Settle window: every step that STARTS before `until_time` (sim seconds)
+/// runs with `settle_dt` (clamped under one frame, as `dt` is) and
+/// `settle_inactive_momentum` (0/1); later steps use the [`ppf_cts_set_params`]
+/// `dt` and `inactive_momentum`. `until_time <= 0` turns it off. Callable
+/// before or after [`ppf_cts_initialize`] (after: from the next step). Frame
+/// timing is unaffected (step until the returned sim time reaches each frame);
+/// the last settle step may run past `until_time` by up to `settle_dt`.
+#[no_mangle]
+pub extern "C" fn ppf_cts_set_settle(
+    ctx: *mut CtsContext,
+    until_time: f64,
+    settle_dt: f32,
+    settle_inactive_momentum: i32,
+) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        ctx.set_settle(until_time, settle_dt, settle_inactive_momentum != 0)
     })
 }
 
