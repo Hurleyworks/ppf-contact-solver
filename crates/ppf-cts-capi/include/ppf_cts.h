@@ -152,6 +152,7 @@ typedef struct CtsMaterial {
     float strainlimit;
     float contact_gap;
     float contact_offset;
+    float length_factor;
 } CtsMaterial;
 
 /**

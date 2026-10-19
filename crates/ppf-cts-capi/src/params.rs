@@ -218,6 +218,10 @@ pub struct CtsMaterial {
     // (a closed surface already bounds a volume); 1D rods need a positive value
     // to have any collision radius -- see noodle.ipynb's `contact-offset`.
     pub contact_offset: f32,
+    // Rod rest-length factor ("length-factor"): each rod edge's rest length is
+    // its drawn length times this. Below 1.0 pre-tensions the rod (yarn.ipynb
+    // uses 0.85). Must be positive. Rods only; mass uses the drawn length.
+    pub length_factor: f32,
 }
 
 impl Default for CtsMaterial {
@@ -233,6 +237,7 @@ impl Default for CtsMaterial {
             strainlimit: 0.0,
             contact_gap: 1e-3,
             contact_offset: 0.0,
+            length_factor: 1.0,
         }
     }
 }

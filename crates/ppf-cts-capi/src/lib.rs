@@ -59,7 +59,9 @@ use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 /// 13: adds `ppf_cts_set_pin_release` (per-pin release time in sim seconds;
 ///    a released pin is dropped and its vertex moves freely). Struct layouts
 ///    are unchanged.
-const ABI_VERSION: u32 = 13;
+/// 14: `CtsMaterial` gains a trailing `length_factor` (rod rest-length
+///    factor, default 1.0; rods only). Struct layout CHANGED.
+const ABI_VERSION: u32 = 14;
 
 /// Current C ABI version. Callers compare against their compiled header.
 #[no_mangle]

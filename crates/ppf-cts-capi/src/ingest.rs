@@ -291,8 +291,11 @@ pub fn build_props(
             ..Default::default()
         };
         let param_index = dedup(&mut edge_param_map, &mut edge_params, param);
+        // As scene.rs: mass from the drawn length, rest length scaled by the
+        // rod rest-length factor (a non-positive factor falls back to 1.0).
+        let factor = if m.length_factor > 0.0 { m.length_factor } else { 1.0 };
         edge.push(EdgeProp {
-            length,
+            length: length * factor,
             initial_length: length,
             mass: m.density * length,
             fixed: false,

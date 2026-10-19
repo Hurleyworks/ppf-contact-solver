@@ -109,6 +109,7 @@ impl AnimatedCollider {
             strainlimit: 0.0,
             contact_gap: self.material.contact_gap,
             contact_offset: 0.0,
+            length_factor: 1.0,
         }
     }
 }
