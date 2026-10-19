@@ -379,6 +379,17 @@ enum CtsStatus ppf_cts_set_pins(struct CtsContext *ctx,
 enum CtsStatus ppf_cts_set_pin_pull(struct CtsContext *ctx, const float *weights, uint32_t count);
 
 /**
+ * Per-pin release times in sim seconds (`count` floats, one per pin in the
+ * `set_pins` index order; `count` must equal the pin count). A pin is
+ * dropped from every step that ends at or after its time, so its vertex
+ * then moves freely (the frontend's `unpin_time`). A time `<= 0` or
+ * non-finite (e.g. infinity) means never released. Not calling this keeps
+ * every pin for the whole run. Call after [`ppf_cts_set_pins`] (which
+ * clears the release times) and before [`ppf_cts_initialize`].
+ */
+enum CtsStatus ppf_cts_set_pin_release(struct CtsContext *ctx, const float *times, uint32_t count);
+
+/**
  * Push per-frame pin target positions (`3*count` floats), aligned with
  * the `set_pins` index order. Pins are exact (Dirichlet) constraints.
  *

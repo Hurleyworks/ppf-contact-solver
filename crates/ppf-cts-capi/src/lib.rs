@@ -56,7 +56,10 @@ use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 ///    `CTS_STATUS_DEVICE_FAULT` (8) with the CUDA message in
 ///    [`ppf_cts_last_error`]. Destroy the context; a new one re-opens the
 ///    device. Struct layouts are unchanged.
-const ABI_VERSION: u32 = 12;
+/// 13: adds `ppf_cts_set_pin_release` (per-pin release time in sim seconds;
+///    a released pin is dropped and its vertex moves freely). Struct layouts
+///    are unchanged.
+const ABI_VERSION: u32 = 13;
 
 /// Current C ABI version. Callers compare against their compiled header.
 #[no_mangle]
@@ -506,6 +509,32 @@ pub extern "C" fn ppf_cts_set_pin_pull(
         }
         let weights = unsafe { slice_f32(weights, count as usize) };
         ctx.set_pin_pull(weights)
+    })
+}
+
+/// Per-pin release times in sim seconds (`count` floats, one per pin in the
+/// `set_pins` index order; `count` must equal the pin count). A pin is
+/// dropped from every step that ends at or after its time, so its vertex
+/// then moves freely (the frontend's `unpin_time`). A time `<= 0` or
+/// non-finite (e.g. infinity) means never released. Not calling this keeps
+/// every pin for the whole run. Call after [`ppf_cts_set_pins`] (which
+/// clears the release times) and before [`ppf_cts_initialize`].
+#[no_mangle]
+pub extern "C" fn ppf_cts_set_pin_release(
+    ctx: *mut CtsContext,
+    times: *const f32,
+    count: u32,
+) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        if times.is_null() && count != 0 {
+            error::set_last_error("set_pin_release: null times with non-zero count");
+            return CtsStatus::BadArg;
+        }
+        let times = unsafe { slice_f32(times, count as usize) };
+        ctx.set_pin_release(times)
     })
 }
 

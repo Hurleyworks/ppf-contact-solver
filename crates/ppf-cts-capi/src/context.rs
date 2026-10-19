@@ -147,6 +147,11 @@ pub struct CtsContext {
     /// `PullPair` of that weight toward the pin's position, else an exact
     /// `FixPair` (as scene.rs `make_constraint`). Empty => every pin is fixed.
     pin_pull: Vec<f32>,
+    /// Per-pin release time (sim seconds), aligned with `pin_indices`: once
+    /// the step's end time reaches it the pin is dropped and its vertex moves
+    /// freely (scene.rs `unpin_time`). `<= 0` or non-finite => never
+    /// released. Empty => no pin is ever released.
+    pin_release: Vec<f32>,
     /// Per-pin target: `Some` => kinematic (driven to the target),
     /// `None` => fixed at its rest position. Aligned with `pin_indices`.
     pin_targets: Vec<Option<Vec3f>>,
@@ -205,6 +210,7 @@ impl CtsContext {
             pin_indices: Vec::new(),
             pin_stiffness: Vec::new(),
             pin_pull: Vec::new(),
+            pin_release: Vec::new(),
             pin_targets: Vec::new(),
             pin_from: Vec::new(),
             pin_segment: (0.0, 0.0),
@@ -532,6 +538,7 @@ impl CtsContext {
         };
         // Default every pin to fixed at rest until a target arrives.
         self.pin_pull = Vec::new();
+        self.pin_release = Vec::new();
         self.pin_targets = vec![None; indices.len()];
         self.pin_from = vec![None; indices.len()];
         self.pin_segment = (0.0, 0.0);
@@ -554,6 +561,32 @@ impl CtsContext {
         }
         self.pin_pull = weights.to_vec();
         CtsStatus::Ok
+    }
+
+    /// Per-pin release times (sim seconds), one per pin in `set_pins` order.
+    /// A pin is dropped from every step that ends at or after its time
+    /// (scene.rs skips a pin once `time >= unpin_time`), so its vertex then
+    /// moves freely. `<= 0` or non-finite means never released. Must come
+    /// before `initialize` (and after `set_pins`, which resets it).
+    pub fn set_pin_release(&mut self, times: &[f32]) -> CtsStatus {
+        if self.initialized {
+            set_last_error("set_pin_release called after initialize");
+            return CtsStatus::BadState;
+        }
+        if times.len() != self.pin_indices.len() {
+            set_last_error("set_pin_release: time count != pin count");
+            return CtsStatus::BadArg;
+        }
+        self.pin_release = times.to_vec();
+        CtsStatus::Ok
+    }
+
+    /// Whether caller pin `i` has been released by sim time `time`.
+    fn pin_released(&self, i: usize, time: f64) -> bool {
+        match self.pin_release.get(i) {
+            Some(&t) if t > 0.0 && t.is_finite() => time >= f64::from(t),
+            _ => false,
+        }
     }
 
     /// Push the targets for the NEXT frame boundary. After `initialize`, each
@@ -632,12 +665,16 @@ impl CtsContext {
     /// eliminates the DOF), so the per-pin stiffness staged by `set_pins` is
     /// accepted but no longer used. A pin with a pull weight `> 0`
     /// (`set_pin_pull`) is a soft `PullPair` toward the same position
-    /// instead, as scene.rs `make_constraint` does.
+    /// instead, as scene.rs `make_constraint` does. A pin past its release
+    /// time (`set_pin_release`) is left out, so its vertex moves freely.
     fn build_constraint(&self, rest_vertex: &Matrix3xX<f32>, time: f64, prev_time: f64) -> Constraint {
         let ghat = self.sim_args.constraint_ghat;
         let mut fix = Vec::with_capacity(self.pin_indices.len());
         let mut pull = Vec::new();
         for (i, &idx) in self.pin_indices.iter().enumerate() {
+            if self.pin_released(i, time) {
+                continue;
+            }
             let kinematic = self.pin_targets[i].is_some();
             let position = self.pin_position(i, time, rest_vertex);
             let weight = self.pin_pull.get(i).copied().unwrap_or(0.0);
@@ -1059,6 +1096,23 @@ mod tests {
         assert_eq!(p.index, 1);
         assert_eq!(p.weight, 0.5);
         assert!((p.position - Vec3f::new(2.0, 3.0, 4.0)).norm() < 1e-6);
+    }
+
+    #[test]
+    fn released_pin_leaves_the_constraint() {
+        let mut ctx = CtsContext::new();
+        assert!(matches!(ctx.set_pins(&[0, 1, 2], None), CtsStatus::Ok));
+        assert!(matches!(ctx.set_pin_release(&[0.5]), CtsStatus::BadArg));
+        assert!(matches!(ctx.set_pin_release(&[0.0, 0.5, f32::INFINITY]), CtsStatus::Ok));
+        let rest = Matrix3xX::<f32>::zeros(3);
+        let before = ctx.build_constraint(&rest, 0.4, 0.3);
+        assert_eq!(before.fix.iter().count(), 3);
+        let after = ctx.build_constraint(&rest, 0.5, 0.4);
+        let fix: Vec<u32> = after.fix.iter().map(|f| f.index).collect();
+        assert_eq!(fix, vec![0, 2]);
+        // set_pins resets the release times.
+        assert!(matches!(ctx.set_pins(&[0, 1, 2], None), CtsStatus::Ok));
+        assert_eq!(ctx.build_constraint(&rest, 9.0, 8.9).fix.iter().count(), 3);
     }
 
     #[test]
