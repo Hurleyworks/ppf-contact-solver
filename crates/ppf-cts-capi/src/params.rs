@@ -255,6 +255,57 @@ pub struct CtsColliderMaterial {
     pub friction: f32,
 }
 
+/// Force-field type. The values are the solver's `force_field::FieldType`;
+/// the types the C API does not take (magnetic, texture, fluid) are absent.
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CtsFieldType {
+    Force = 0,
+    /// Moving air: acts only through the air drag, so it needs
+    /// `CtsGlobalParams.air_density > 0`.
+    Wind = 1,
+    Vortex = 2,
+    Turbulence = 3,
+    Drag = 5,
+    Harmonic = 6,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CtsFieldShape {
+    Point = 0,
+    Plane = 1,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CtsFieldFalloff {
+    Sphere = 0,
+    Tube = 1,
+    Cone = 2,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CtsFieldZDirection {
+    Both = 0,
+    Positive = 1,
+    Negative = 2,
+}
+
+/// One force field's fixed settings (see `ppf_cts_add_force_field`).
+/// `flags` is a mask of the `CTS_FIELD_*` bits.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CtsForceField {
+    pub field_type: CtsFieldType,
+    pub shape: CtsFieldShape,
+    pub falloff: CtsFieldFalloff,
+    pub z_direction: CtsFieldZDirection,
+    pub flags: u32,
+    pub seed: u32,
+}
+
 impl Default for CtsColliderMaterial {
     fn default() -> Self {
         Self {

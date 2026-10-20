@@ -10,6 +10,24 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * `CtsForceField.flags` bits (the solver's field header flags).
+ */
+#define CTS_FIELD_USE_MIN 1
+
+#define CTS_FIELD_USE_MAX 2
+
+#define CTS_FIELD_USE_RADIAL_MIN 4
+
+#define CTS_FIELD_USE_RADIAL_MAX 8
+
+#define CTS_FIELD_GRAVITATION 16
+
+/**
+ * Floats per track sample in `ppf_cts_add_force_field`'s `track`.
+ */
+#define CTS_FIELD_TRACK_FLOATS 28
+
 enum CtsBarrier
 #ifdef __cplusplus
   : uint32_t
@@ -21,6 +39,68 @@ enum CtsBarrier
 };
 #ifndef __cplusplus
 typedef uint32_t CtsBarrier;
+#endif // __cplusplus
+
+enum CtsFieldFalloff
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+    CTS_FIELD_FALLOFF_SPHERE = 0,
+    CTS_FIELD_FALLOFF_TUBE = 1,
+    CTS_FIELD_FALLOFF_CONE = 2,
+};
+#ifndef __cplusplus
+typedef uint32_t CtsFieldFalloff;
+#endif // __cplusplus
+
+enum CtsFieldShape
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+    CTS_FIELD_SHAPE_POINT = 0,
+    CTS_FIELD_SHAPE_PLANE = 1,
+};
+#ifndef __cplusplus
+typedef uint32_t CtsFieldShape;
+#endif // __cplusplus
+
+/**
+ * Force-field type. The values are the solver's `force_field::FieldType`;
+ * the types the C API does not take (magnetic, texture, fluid) are absent.
+ */
+enum CtsFieldType
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+    CTS_FIELD_TYPE_FORCE = 0,
+    /**
+     * Moving air: acts only through the air drag, so it needs
+     * `CtsGlobalParams.air_density > 0`.
+     */
+    CTS_FIELD_TYPE_WIND = 1,
+    CTS_FIELD_TYPE_VORTEX = 2,
+    CTS_FIELD_TYPE_TURBULENCE = 3,
+    CTS_FIELD_TYPE_DRAG = 5,
+    CTS_FIELD_TYPE_HARMONIC = 6,
+};
+#ifndef __cplusplus
+typedef uint32_t CtsFieldType;
+#endif // __cplusplus
+
+enum CtsFieldZDirection
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+    CTS_FIELD_Z_DIRECTION_BOTH = 0,
+    CTS_FIELD_Z_DIRECTION_POSITIVE = 1,
+    CTS_FIELD_Z_DIRECTION_NEGATIVE = 2,
+};
+#ifndef __cplusplus
+typedef uint32_t CtsFieldZDirection;
 #endif // __cplusplus
 
 enum CtsFrictionMode
@@ -169,6 +249,19 @@ typedef struct CtsColliderMaterial {
     float contact_gap;
     float friction;
 } CtsColliderMaterial;
+
+/**
+ * One force field's fixed settings (see `ppf_cts_add_force_field`).
+ * `flags` is a mask of the `CTS_FIELD_*` bits.
+ */
+typedef struct CtsForceField {
+    CtsFieldType field_type;
+    CtsFieldShape shape;
+    CtsFieldFalloff falloff;
+    CtsFieldZDirection z_direction;
+    uint32_t flags;
+    uint32_t seed;
+} CtsForceField;
 
 #ifdef __cplusplus
 extern "C" {
@@ -466,6 +559,55 @@ enum CtsStatus ppf_cts_set_settle(struct CtsContext *ctx,
                                   double until_time,
                                   float settle_dt,
                                   int32_t settle_inactive_momentum);
+
+/**
+ * Add one force field (before [`ppf_cts_initialize`], which installs every
+ * staged field). `f` holds the fixed settings: `field_type` (force, wind,
+ * vortex, turbulence, drag, harmonic; any other value is `BAD_ARG`), shape,
+ * falloff, Z direction, `CTS_FIELD_*` flag bits and a noise seed. Every
+ * field acts on every vertex, scaled by [`ppf_cts_set_force_field_weights`].
+ *
+ * The animated part is a track of `samples` (>= 1) samples at sim times
+ * `start + k * step` (`step > 0` when `samples > 1`), lerped between and
+ * held past the ends: `origins` 3 doubles per sample (world position), and
+ * `track` `CTS_FIELD_TRACK_FLOATS` (28) floats per sample: [0..9] the
+ * field's local X, Y, Z axes as columns (orthonormal), 9 strength, 10
+ * falloff power, 11 min distance, 12 max distance, 13 radial power, 14
+ * radial min, 15 radial max, 16 size (turbulence: > 0), 17 noise amount,
+ * 18, 19, 20 noise scale along local X, Y, Z (> 0; 1 = unscaled), 21 wind
+ * factor (wind: 0), 22 linear drag, 23 quadratic drag, 24 harmonic damping,
+ * 25 rest length, 26 vortex inflow, 27 unused (0).
+ *
+ * The field is checked with the solver's own verifier; a field it refuses
+ * returns `BAD_ARG` with the reason in [`ppf_cts_last_error`]. A wind acts
+ * only through the air drag, so [`ppf_cts_initialize`] refuses one when
+ * `CtsGlobalParams.air_density` is not > 0.
+ */
+enum CtsStatus ppf_cts_add_force_field(struct CtsContext *ctx,
+                                       const struct CtsForceField *f,
+                                       const double *origins,
+                                       const float *track,
+                                       uint32_t samples,
+                                       float start,
+                                       float step);
+
+/**
+ * Per-vertex force-field weight (`count` floats, 0 = not pushed, 1 = full,
+ * default 1), in the [`ppf_cts_set_geometry_ex`] vertex order; `count` must
+ * equal that call's vertex count. Remapped at initialize like pins;
+ * animated-collider shells always get 0. Call after
+ * [`ppf_cts_set_geometry_ex`] (which clears it) and before
+ * [`ppf_cts_initialize`].
+ */
+enum CtsStatus ppf_cts_set_force_field_weights(struct CtsContext *ctx,
+                                               const float *weight,
+                                               uint32_t count);
+
+/**
+ * Drop every staged force field and the weights. Before
+ * [`ppf_cts_initialize`] only.
+ */
+enum CtsStatus ppf_cts_clear_force_fields(struct CtsContext *ctx);
 
 /**
  * Stage SAND granular material. Every grain is a loose vertex (no

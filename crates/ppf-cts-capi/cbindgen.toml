@@ -20,7 +20,9 @@ cpp_compat = true
 [export]
 prefix = ""
 include = ["CtsStatus", "CtsModel", "CtsBarrier", "CtsFrictionMode",
-           "CtsGlobalParams", "CtsMaterial", "CtsColliderMaterial"]
+           "CtsGlobalParams", "CtsMaterial", "CtsColliderMaterial",
+           "CtsFieldType", "CtsFieldShape", "CtsFieldFalloff", "CtsFieldZDirection",
+           "CtsForceField"]
 
 # QualifiedScreamingSnakeCase already qualifies each variant with the enum
 # name (Cubic -> CTS_BARRIER_CUBIC), so prefix_with_name is intentionally

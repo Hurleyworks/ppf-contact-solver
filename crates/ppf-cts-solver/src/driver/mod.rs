@@ -1550,6 +1550,22 @@ pub(crate) fn install_force_field(field: &crate::force_field::ForceFieldData, wo
     }
 }
 
+/// [`install_force_field`] for in-memory embedders: a refused install is
+/// returned as its message instead of ending the process. The field must
+/// already be verified (`force_field::verify_field`).
+pub(crate) fn try_install_force_field(
+    field: &crate::force_field::ForceFieldData,
+    world_scaling: f32,
+) -> Result<(), String> {
+    let Ok(mut guard) = SOLVER.lock() else {
+        return Err("solver driver: the solver state is poisoned".into());
+    };
+    let Some(state) = guard.as_mut() else {
+        return Err("solver driver: install_force_field was called before initialize()".into());
+    };
+    with_device(|device| state.field.install(device, field, world_scaling)).map_err(|f| f.detail)
+}
+
 /// Lay the multigrid preconditioner's hierarchy over the scene's authored
 /// positions, when the scene names that preconditioner.
 ///

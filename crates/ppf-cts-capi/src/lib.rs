@@ -23,7 +23,7 @@ use std::ffi::c_char;
 
 use context::CtsContext;
 use error::{guard, guard_value, last_error_ptr, CtsStatus};
-use params::{CtsColliderMaterial, CtsGlobalParams, CtsMaterial, CtsModel};
+use params::{CtsColliderMaterial, CtsForceField, CtsGlobalParams, CtsMaterial, CtsModel};
 use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 
 /// Bumped whenever the C ABI (struct layouts or function signatures)
@@ -65,7 +65,19 @@ use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 ///    and `ppf_cts_set_settle` (a settle window with its own dt and inactive
 ///    momentum). `CtsGlobalParams.stitch_stiffness` stays ignored (stiffness
 ///    comes per `ppf_cts_set_stitches` call). Struct layouts are unchanged.
-const ABI_VERSION: u32 = 15;
+/// 16: force fields: adds `CtsForceField`, `ppf_cts_add_force_field`,
+///    `ppf_cts_set_force_field_weights` and `ppf_cts_clear_force_fields`.
+///    Existing struct layouts are unchanged.
+const ABI_VERSION: u32 = 16;
+
+/// `CtsForceField.flags` bits (the solver's field header flags).
+pub const CTS_FIELD_USE_MIN: u32 = 1;
+pub const CTS_FIELD_USE_MAX: u32 = 2;
+pub const CTS_FIELD_USE_RADIAL_MIN: u32 = 4;
+pub const CTS_FIELD_USE_RADIAL_MAX: u32 = 8;
+pub const CTS_FIELD_GRAVITATION: u32 = 16;
+/// Floats per track sample in `ppf_cts_add_force_field`'s `track`.
+pub const CTS_FIELD_TRACK_FLOATS: u32 = 28;
 
 /// Current C ABI version. Callers compare against their compiled header.
 #[no_mangle]
@@ -669,6 +681,102 @@ pub extern "C" fn ppf_cts_set_settle(
             return CtsStatus::Null;
         };
         ctx.set_settle(until_time, settle_dt, settle_inactive_momentum != 0)
+    })
+}
+
+/// Add one force field (before [`ppf_cts_initialize`], which installs every
+/// staged field). `f` holds the fixed settings: `field_type` (force, wind,
+/// vortex, turbulence, drag, harmonic; any other value is `BAD_ARG`), shape,
+/// falloff, Z direction, `CTS_FIELD_*` flag bits and a noise seed. Every
+/// field acts on every vertex, scaled by [`ppf_cts_set_force_field_weights`].
+///
+/// The animated part is a track of `samples` (>= 1) samples at sim times
+/// `start + k * step` (`step > 0` when `samples > 1`), lerped between and
+/// held past the ends: `origins` 3 doubles per sample (world position), and
+/// `track` `CTS_FIELD_TRACK_FLOATS` (28) floats per sample: [0..9] the
+/// field's local X, Y, Z axes as columns (orthonormal), 9 strength, 10
+/// falloff power, 11 min distance, 12 max distance, 13 radial power, 14
+/// radial min, 15 radial max, 16 size (turbulence: > 0), 17 noise amount,
+/// 18, 19, 20 noise scale along local X, Y, Z (> 0; 1 = unscaled), 21 wind
+/// factor (wind: 0), 22 linear drag, 23 quadratic drag, 24 harmonic damping,
+/// 25 rest length, 26 vortex inflow, 27 unused (0).
+///
+/// The field is checked with the solver's own verifier; a field it refuses
+/// returns `BAD_ARG` with the reason in [`ppf_cts_last_error`]. A wind acts
+/// only through the air drag, so [`ppf_cts_initialize`] refuses one when
+/// `CtsGlobalParams.air_density` is not > 0.
+#[no_mangle]
+pub extern "C" fn ppf_cts_add_force_field(
+    ctx: *mut CtsContext,
+    f: *const CtsForceField,
+    origins: *const f64,
+    track: *const f32,
+    samples: u32,
+    start: f32,
+    step: f32,
+) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        if f.is_null() || origins.is_null() || track.is_null() || samples == 0 {
+            error::set_last_error("add_force_field: null field/arrays or zero samples");
+            return CtsStatus::BadArg;
+        }
+        // The four enums lead the struct as u32 words. Read them raw before
+        // forming `&CtsForceField`: a value outside an enum would be
+        // undefined behaviour once typed.
+        let words = unsafe { slice_u32(f.cast::<u32>(), 4) };
+        let allowed: [&[u32]; 4] = [&[0, 1, 2, 3, 5, 6], &[0, 1], &[0, 1, 2], &[0, 1, 2]];
+        for (i, (word, ok)) in words.iter().zip(allowed).enumerate() {
+            if !ok.contains(word) {
+                let what = ["field_type", "shape", "falloff", "z_direction"][i];
+                error::set_last_error(format!("add_force_field: unsupported {what} {word}"));
+                return CtsStatus::BadArg;
+            }
+        }
+        let f = unsafe { &*f };
+        let n = samples as usize;
+        let origins = unsafe { slice_f64(origins, 3 * n) };
+        let track = unsafe { slice_f32(track, CTS_FIELD_TRACK_FLOATS as usize * n) };
+        ctx.add_force_field(f, origins, track, start, step)
+    })
+}
+
+/// Per-vertex force-field weight (`count` floats, 0 = not pushed, 1 = full,
+/// default 1), in the [`ppf_cts_set_geometry_ex`] vertex order; `count` must
+/// equal that call's vertex count. Remapped at initialize like pins;
+/// animated-collider shells always get 0. Call after
+/// [`ppf_cts_set_geometry_ex`] (which clears it) and before
+/// [`ppf_cts_initialize`].
+#[no_mangle]
+pub extern "C" fn ppf_cts_set_force_field_weights(
+    ctx: *mut CtsContext,
+    weight: *const f32,
+    count: u32,
+) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        if weight.is_null() || count == 0 {
+            error::set_last_error("set_force_field_weights: weight null or empty");
+            return CtsStatus::BadArg;
+        }
+        let weight = unsafe { slice_f32(weight, count as usize) };
+        ctx.set_force_field_weights(weight)
+    })
+}
+
+/// Drop every staged force field and the weights. Before
+/// [`ppf_cts_initialize`] only.
+#[no_mangle]
+pub extern "C" fn ppf_cts_clear_force_fields(ctx: *mut CtsContext) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        ctx.clear_force_fields()
     })
 }
 

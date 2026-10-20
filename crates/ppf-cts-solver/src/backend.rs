@@ -426,6 +426,18 @@ impl Backend {
         true
     }
 
+    /// Install a verified force field for embedders, after
+    /// [`Backend::initialize_in_memory`]. Replaces whatever was installed.
+    /// A refusal (e.g. a device allocation failure) comes back as its
+    /// message rather than ending the process.
+    pub fn install_force_field(
+        &self,
+        field: &crate::force_field::ForceFieldData,
+        world_scaling: f32,
+    ) -> Result<(), String> {
+        crate::driver::try_install_force_field(field, world_scaling)
+    }
+
     /// One in-memory solver step for embedders. Mirrors the body of `run`'s
     /// loop minus the file IO, frame detection, GPU-clock sampling and the
     /// `Scene`-driven param/velocity/rest-shape/material updates: push the

@@ -18,12 +18,18 @@ use ppf_cts_solver::data::{
     CollisionMesh, Constraint, DataSet, FaceParam, FaceProp, FixPair, ParamSet, PullPair, Stitch,
     Vec3f, Vec6f, Vec6u, PDRD_BODY_ROW_LEN, ROTATION_LOCK_ALLOW_ONLY, TRANSLATION_LOCK_AXIS,
 };
+use ppf_cts_solver::force_field::{
+    self, Falloff, FieldRecord, FieldShape, FieldType, ForceFieldData, ZDirection,
+};
 use ppf_cts_solver::triutils;
 use ppf_cts_solver::{CVec, SimArgs};
 
 use crate::error::{set_last_error, CtsStatus};
 use crate::ingest;
-use crate::params::{CtsColliderMaterial, CtsGlobalParams, CtsMaterial, CtsModel};
+use crate::params::{
+    CtsColliderMaterial, CtsFieldFalloff, CtsFieldShape, CtsFieldType, CtsFieldZDirection,
+    CtsForceField, CtsGlobalParams, CtsMaterial, CtsModel,
+};
 
 /// Geometry as staged by `set_geometry_ex`, in the caller's indexing. The
 /// `MeshSet` is built at `initialize`, after animated-collider shells are
@@ -188,6 +194,13 @@ pub struct CtsContext {
     /// empty => every vertex starts at rest. Remapped to the merged order at
     /// `initialize` (shell vertices start at rest).
     velocities: Vec<f32>,
+    /// Force fields (`add_force_field`), verified, every one targeting all
+    /// vertices. Installed at `initialize`.
+    force_fields: Vec<FieldRecord>,
+    /// Per-vertex field weight in the caller's staged vertex order; empty =>
+    /// 1 for every caller vertex. Remapped to the merged order at
+    /// `initialize`; animated-collider shell vertices get 0.
+    field_weight: Vec<f32>,
     /// Granular (SAND) scalar material, `Some` once `set_sand` is called.
     /// Threaded into `Props.sand` at `initialize`; grains are loose
     /// vertices (no incident element) in the staged geometry.
@@ -235,6 +248,8 @@ impl CtsContext {
             collider: None,
             animated_colliders: Vec::new(),
             velocities: Vec::new(),
+            force_fields: Vec::new(),
+            field_weight: Vec::new(),
             sand: None,
             pdrd_body_rows: Vec::new(),
             pdrd_vert_index: Vec::new(),
@@ -324,6 +339,7 @@ impl CtsContext {
             }
         }
         self.velocities.clear();
+        self.field_weight.clear();
         self.materials = materials.to_vec();
         self.face_mat_idx = face_mat_idx.map(|a| a.to_vec()).unwrap_or_default();
         self.tet_mat_idx = tet_mat_idx.map(|a| a.to_vec()).unwrap_or_default();
@@ -358,6 +374,113 @@ impl CtsContext {
             return CtsStatus::BadArg;
         }
         self.velocities = velocities.to_vec();
+        CtsStatus::Ok
+    }
+
+    /// Stage one force field: `origins` 3 per sample (solver world space),
+    /// `track` `TRACK_FILE_FLOATS` (28) per sample, sampled at
+    /// `start + k * step` sim seconds. Checked by the solver's own
+    /// `verify_field` (and the origin reach `install` would refuse), so a bad
+    /// field is `BadArg` here rather than a fatal at install. Array lengths
+    /// and the enum values are the caller's (lib.rs) job.
+    pub fn add_force_field(
+        &mut self,
+        f: &CtsForceField,
+        origins: &[f64],
+        track: &[f32],
+        start: f32,
+        step: f32,
+    ) -> CtsStatus {
+        if self.initialized {
+            set_last_error("add_force_field called after initialize");
+            return CtsStatus::BadState;
+        }
+        let known = force_field::flag::USE_MIN
+            | force_field::flag::USE_MAX
+            | force_field::flag::USE_RADIAL_MIN
+            | force_field::flag::USE_RADIAL_MAX
+            | force_field::flag::GRAVITATION;
+        if f.flags & !known != 0 {
+            set_last_error(format!("add_force_field: unknown flag bits {:#x}", f.flags & !known));
+            return CtsStatus::BadArg;
+        }
+        let record = FieldRecord {
+            kind: match f.field_type {
+                CtsFieldType::Force => FieldType::Force,
+                CtsFieldType::Wind => FieldType::Wind,
+                CtsFieldType::Vortex => FieldType::Vortex,
+                CtsFieldType::Turbulence => FieldType::Turbulence,
+                CtsFieldType::Drag => FieldType::Drag,
+                CtsFieldType::Harmonic => FieldType::Harmonic,
+            },
+            shape: match f.shape {
+                CtsFieldShape::Point => FieldShape::Point,
+                CtsFieldShape::Plane => FieldShape::Plane,
+            },
+            falloff: match f.falloff {
+                CtsFieldFalloff::Sphere => Falloff::Sphere,
+                CtsFieldFalloff::Tube => Falloff::Tube,
+                CtsFieldFalloff::Cone => Falloff::Cone,
+            },
+            z_direction: match f.z_direction {
+                CtsFieldZDirection::Both => ZDirection::Both,
+                CtsFieldZDirection::Positive => ZDirection::Positive,
+                CtsFieldZDirection::Negative => ZDirection::Negative,
+            },
+            flags: f.flags,
+            seed: f.seed,
+            start,
+            step,
+            origin: origins.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
+            track: track.to_vec(),
+            target: force_field::ALL_TARGETS,
+            texture: None,
+            fluid: None,
+        };
+        if let Err(e) = force_field::verify_field(&record) {
+            set_last_error(format!("add_force_field: {e}"));
+            return CtsStatus::BadArg;
+        }
+        // World scaling is 1 on this path, so the reach is in scene units.
+        if origins.iter().any(|o| o.abs() > force_field::ORIGIN_REACH) {
+            set_last_error("add_force_field: an origin is past the solver's reach (1e6)");
+            return CtsStatus::BadArg;
+        }
+        self.force_fields.push(record);
+        CtsStatus::Ok
+    }
+
+    /// Per-vertex field weight (0 = not pushed) in `set_geometry_ex` vertex
+    /// order; must follow `set_geometry_ex`, which clears it.
+    pub fn set_force_field_weights(&mut self, weight: &[f32]) -> CtsStatus {
+        if self.initialized {
+            set_last_error("set_force_field_weights called after initialize");
+            return CtsStatus::BadState;
+        }
+        let Some(geometry) = self.geometry.as_ref() else {
+            set_last_error("set_force_field_weights before set_geometry");
+            return CtsStatus::BadState;
+        };
+        if 3 * weight.len() != geometry.verts.len() {
+            set_last_error("set_force_field_weights: count != set_geometry vertex count");
+            return CtsStatus::BadArg;
+        }
+        if !weight.iter().all(|w| w.is_finite()) {
+            set_last_error("set_force_field_weights: non-finite weight");
+            return CtsStatus::BadArg;
+        }
+        self.field_weight = weight.to_vec();
+        CtsStatus::Ok
+    }
+
+    /// Drop every staged force field and weight.
+    pub fn clear_force_fields(&mut self) -> CtsStatus {
+        if self.initialized {
+            set_last_error("clear_force_fields called after initialize");
+            return CtsStatus::BadState;
+        }
+        self.force_fields.clear();
+        self.field_weight.clear();
         CtsStatus::Ok
     }
 
@@ -858,6 +981,10 @@ impl CtsContext {
             set_last_error("set_stitches: stitch index >= vertex count");
             return CtsStatus::BadArg;
         }
+        if self.force_fields.iter().any(FieldRecord::is_air) && !(self.sim_args.air_density > 0.0) {
+            set_last_error("add_force_field: a wind field needs air_density > 0");
+            return CtsStatus::BadArg;
+        }
 
         // Splice the animated-collider pin shells in after the caller's
         // contact vertices / shell faces, each with its own material row.
@@ -921,6 +1048,17 @@ impl CtsContext {
             let col = merged.remap(i as u32) as usize;
             velocity.set_column(col, &Vec3f::new(v[0], v[1], v[2]));
         }
+
+        // Field weights in the merged order: caller vertices take theirs (1
+        // when none were given), animated-collider shells 0.
+        let field_weight = (!self.force_fields.is_empty()).then(|| {
+            let mut w = vec![0.0f32; merged.verts.len() / 3];
+            for i in 0..staged_vertex_count {
+                let given = self.field_weight.get(i).copied().unwrap_or(1.0);
+                w[merged.remap(i as u32) as usize] = given;
+            }
+            w
+        });
 
         let meshset = ingest::build_meshset(
             &merged.verts,
@@ -1019,6 +1157,19 @@ impl CtsContext {
             self.dataset = None;
             set_last_error("backend initialize_in_memory failed");
             return CtsStatus::InitFailed;
+        }
+        if let Some(weight) = field_weight {
+            let data = ForceFieldData {
+                fields: std::mem::take(&mut self.force_fields),
+                scripts: Vec::new(),
+                weight: Some(weight),
+                target_mask: None,
+            };
+            if let Err(e) = backend.install_force_field(&data, 1.0) {
+                self.dataset = None;
+                set_last_error(format!("force field install failed: {e}"));
+                return CtsStatus::InitFailed;
+            }
         }
 
         self.surface_vert_count = surface_vert_count;
@@ -1448,6 +1599,113 @@ mod tests {
         let end = gap(&ctx);
         eprintln!("stitch gap after {time:.3} s: {end}");
         assert!(end < 0.01, "gap {end} did not close");
+    }
+
+    /// One track sample: identity axes, `strength`, no falloff, unit noise
+    /// scale, turbulence `size`.
+    fn field_track(strength: f32, size: f32) -> Vec<f32> {
+        let mut t = vec![0.0f32; 28];
+        t[0] = 1.0;
+        t[4] = 1.0;
+        t[8] = 1.0;
+        t[9] = strength;
+        t[16] = size;
+        t[18..21].copy_from_slice(&[1.0, 1.0, 1.0]);
+        t
+    }
+
+    fn field(field_type: CtsFieldType) -> CtsForceField {
+        CtsForceField {
+            field_type,
+            shape: CtsFieldShape::Point,
+            falloff: CtsFieldFalloff::Sphere,
+            z_direction: CtsFieldZDirection::Both,
+            flags: 0,
+            seed: 0,
+        }
+    }
+
+    #[test]
+    fn bad_force_fields_are_bad_args() {
+        let mut ctx = CtsContext::new();
+        let origin = [0.0f64; 3];
+        // A turbulence of size 0: the solver's verifier refuses it.
+        let status = ctx.add_force_field(&field(CtsFieldType::Turbulence), &origin, &field_track(1.0, 0.0), 0.0, 0.0);
+        assert!(matches!(status, CtsStatus::BadArg));
+        assert!(last_error_text().contains("size"), "{}", last_error_text());
+        // Axes that are not orthonormal.
+        let mut track = field_track(1.0, 1.0);
+        track[0] = 2.0;
+        let status = ctx.add_force_field(&field(CtsFieldType::Force), &origin, &track, 0.0, 0.0);
+        assert!(matches!(status, CtsStatus::BadArg));
+        // Two samples with no spacing; an unknown flag bit.
+        let two: Vec<f32> = [field_track(1.0, 1.0), field_track(1.0, 1.0)].concat();
+        let status = ctx.add_force_field(&field(CtsFieldType::Force), &[0.0; 6], &two, 0.0, 0.0);
+        assert!(matches!(status, CtsStatus::BadArg));
+        let mut flagged = field(CtsFieldType::Force);
+        flagged.flags = 64;
+        let status = ctx.add_force_field(&flagged, &origin, &field_track(1.0, 1.0), 0.0, 0.0);
+        assert!(matches!(status, CtsStatus::BadArg));
+        assert!(ctx.force_fields.is_empty());
+        // Magnetic (4) through the C entry: refused before it is typed.
+        let raw = [4u32, 0, 0, 0, 0, 0];
+        let status = crate::ppf_cts_add_force_field(
+            &mut ctx,
+            raw.as_ptr().cast(),
+            origin.as_ptr(),
+            field_track(1.0, 1.0).as_ptr(),
+            1,
+            0.0,
+            0.0,
+        );
+        assert!(matches!(status, CtsStatus::BadArg));
+        assert!(last_error_text().contains("field_type"));
+        // A good one is kept; weights need geometry and a matching count.
+        let status = ctx.add_force_field(&field(CtsFieldType::Force), &origin, &field_track(1.0, 0.0), 0.0, 0.0);
+        assert!(matches!(status, CtsStatus::Ok), "{}", last_error_text());
+        assert_eq!(ctx.force_fields.len(), 1);
+        assert!(matches!(ctx.set_force_field_weights(&[1.0; 4]), CtsStatus::BadState));
+        assert!(matches!(stage_tet(&mut ctx, &[solid(CtsModel::Arap)], None), CtsStatus::Ok));
+        assert!(matches!(ctx.set_force_field_weights(&[1.0; 3]), CtsStatus::BadArg));
+        assert!(matches!(ctx.set_force_field_weights(&[1.0; 4]), CtsStatus::Ok));
+        assert!(matches!(ctx.clear_force_fields(), CtsStatus::Ok));
+        assert!(ctx.force_fields.is_empty() && ctx.field_weight.is_empty());
+    }
+
+    /// A 10 cm sheet, no gravity, no air, pushed by a point force 10 m off
+    /// along -x (no falloff, so nearly uniform +x). Needs a GPU backend.
+    #[test]
+    fn force_field_pushes_the_sheet_along_x() {
+        if ppf_cts_solver::linked_backend_name().is_none() {
+            eprintln!("skipped: no GPU backend linked");
+            return;
+        }
+        let mut ctx = CtsContext::new();
+        let params = CtsGlobalParams {
+            gravity: [0.0; 3],
+            air_density: 0.0,
+            air_friction: 0.0,
+            ..CtsGlobalParams::default()
+        };
+        assert!(matches!(ctx.set_params(&params), CtsStatus::Ok));
+        let verts = [0.0f32, 0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.0, 0.0, 0.1, 0.0];
+        let faces = [0u32, 1, 2, 0, 2, 3];
+        let status = ctx.set_geometry_ex(&verts, &faces, &[], &[], 2, &[CtsMaterial::default()], None, None, None);
+        assert!(matches!(status, CtsStatus::Ok));
+        let status = ctx.add_force_field(&field(CtsFieldType::Force), &[-10.0, 0.0, 0.0], &field_track(5.0, 0.0), 0.0, 0.0);
+        assert!(matches!(status, CtsStatus::Ok), "{}", last_error_text());
+        assert!(matches!(ctx.initialize(), CtsStatus::Ok), "{}", last_error_text());
+        let mut time = 0.0;
+        for _ in 0..100 {
+            assert!(matches!(ctx.step(Some(&mut time)), CtsStatus::Ok), "{}", last_error_text());
+        }
+        let mut out = [0.0f32; 12];
+        assert!(matches!(ctx.read_positions(&mut out), CtsStatus::Ok));
+        let mean = |a: usize| (0..4).map(|i| out[3 * i + a] - verts[3 * i + a]).sum::<f32>() / 4.0;
+        let (dx, dy, dz) = (mean(0), mean(1), mean(2));
+        eprintln!("force field moved the sheet ({dx}, {dy}, {dz}) in {time:.3} s");
+        assert!(dx > 0.005, "dx {dx}");
+        assert!(dy.abs() < 0.2 * dx && dz.abs() < 0.2 * dx, "({dx}, {dy}, {dz})");
     }
 
     #[test]
