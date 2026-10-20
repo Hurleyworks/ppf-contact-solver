@@ -224,6 +224,20 @@ pub struct CtsMaterial {
     // its drawn length times this. Below 1.0 pre-tensions the rod (yarn.ipynb
     // uses 0.85). Must be positive. Rods only; mass uses the drawn length.
     pub length_factor: f32,
+    // Stretch plasticity ("plasticity", "plasticity-threshold"): shell faces
+    // and tets. The rest shape creeps toward the current shape at this rate
+    // (per second, alpha = 1 - exp(-rate * dt) per step) wherever a principal
+    // stretch S leaves the dead zone |S - 1| > threshold (dimensionless).
+    // 0 = off. Both must be non-negative. Rods ignore them.
+    pub plasticity: f32,
+    pub plasticity_threshold: f32,
+    // Bend plasticity ("bend-plasticity", "bend-plasticity-threshold"): shell
+    // hinges and interior rod joints. The rest bend angle creeps toward the
+    // current angle at this rate (per second) once it is more than the
+    // threshold (radians) away. 0 = off. Both must be non-negative. Tets
+    // ignore them.
+    pub bend_plasticity: f32,
+    pub bend_plasticity_threshold: f32,
 }
 
 impl Default for CtsMaterial {
@@ -240,6 +254,10 @@ impl Default for CtsMaterial {
             contact_gap: 1e-3,
             contact_offset: 0.0,
             length_factor: 1.0,
+            plasticity: 0.0,
+            plasticity_threshold: 0.0,
+            bend_plasticity: 0.0,
+            bend_plasticity_threshold: 0.0,
         }
     }
 }

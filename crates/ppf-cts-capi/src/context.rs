@@ -116,6 +116,10 @@ impl AnimatedCollider {
             contact_gap: self.material.contact_gap,
             contact_offset: 0.0,
             length_factor: 1.0,
+            plasticity: 0.0,
+            plasticity_threshold: 0.0,
+            bend_plasticity: 0.0,
+            bend_plasticity_threshold: 0.0,
         }
     }
 }
@@ -292,6 +296,21 @@ impl CtsContext {
         if materials.is_empty() {
             set_last_error("set_geometry_ex: material table is empty");
             return CtsStatus::BadArg;
+        }
+        // scene.rs asserts the four plasticity values non-negative.
+        for (row, m) in materials.iter().enumerate() {
+            let plastic = [
+                m.plasticity,
+                m.plasticity_threshold,
+                m.bend_plasticity,
+                m.bend_plasticity_threshold,
+            ];
+            if plastic.iter().any(|v| !(*v >= 0.0) || !v.is_finite()) {
+                set_last_error(format!(
+                    "set_geometry_ex: material row {row}: plasticity values must be finite and non-negative"
+                ));
+                return CtsStatus::BadArg;
+            }
         }
         let face_count = faces.len() / 3;
         let tet_count = tets.len() / 4;
@@ -1179,6 +1198,26 @@ impl CtsContext {
     }
 
     pub fn step(&mut self, out_sim_time: Option<&mut f64>) -> CtsStatus {
+        self.step_capped(None, out_sim_time)
+    }
+
+    /// One step as [`Self::step`], cut to end exactly on `max_time` when it
+    /// would pass it or stop short of it by under 1/1000 of a step (no
+    /// micro step left over). `max_time` must be after the current sim time.
+    pub fn step_until(&mut self, max_time: f64, out_sim_time: Option<&mut f64>) -> CtsStatus {
+        if !self.initialized {
+            set_last_error("step_until before initialize");
+            return CtsStatus::BadState;
+        }
+        let now = self.backend.as_ref().unwrap().state.time;
+        if !max_time.is_finite() || !(max_time > now) {
+            set_last_error("step_until: max_time must be finite and after the current sim time");
+            return CtsStatus::BadArg;
+        }
+        self.step_capped(Some(max_time), out_sim_time)
+    }
+
+    fn step_capped(&mut self, max_time: Option<f64>, out_sim_time: Option<&mut f64>) -> CtsStatus {
         if !self.initialized {
             set_last_error("step before initialize");
             return CtsStatus::BadState;
@@ -1190,14 +1229,26 @@ impl CtsContext {
             let gravity = self.gravity_at(self.backend.as_ref().unwrap().state.time);
             self.param.as_mut().unwrap().gravity = gravity;
         }
+        // `step_until`'s landing time and the cut step's length.
+        let land: Option<(f64, f64)>;
         {
             // Settle window or the built values. The driver scales its
             // velocity predictor by dt / prev_dt, so a dt change between
             // steps is safe (scene.rs's `dt` schedule does the same).
-            let (dt, momentum) = self.step_dt(self.backend.as_ref().unwrap().state.time);
+            let start = self.backend.as_ref().unwrap().state.time;
+            let (dt, momentum) = self.step_dt(start);
             let param = self.param.as_mut().unwrap();
             param.dt = dt;
             param.inactive_momentum = momentum;
+            // `step_until`: cut (or stretch by under 1/1000) to land on
+            // `max_time`; the predictor's dt / prev_dt ratio handles it.
+            land = match max_time {
+                Some(until) if f64::from(dt) * 1.001 >= until - start => {
+                    param.dt = (until - start) as f32;
+                    Some((until, until - start))
+                }
+                _ => None,
+            };
         }
         let constraint = {
             let backend = self.backend.as_ref().unwrap();
@@ -1220,6 +1271,17 @@ impl CtsContext {
         if !result.success() {
             set_last_error("solver step failed (CCD/PCG/intersection)");
             return CtsStatus::StepFailed;
+        }
+        // A cut step that ran its full length ends on `max_time` up to f32
+        // round-off in dt; snap the clock (driver and state) onto it. A step
+        // a contact shortened is left where it stopped.
+        if let Some((until, length)) = land {
+            let param = self.param.as_mut().unwrap();
+            if (until - param.time).abs() <= 1e-5 * length {
+                param.time = until;
+                param.time_f32 = until as f32;
+                backend.state.time = until;
+            }
         }
         let sim_time = backend.state.time;
         if let Some(slot) = out_sim_time {
@@ -1532,6 +1594,64 @@ mod tests {
         }
     }
 
+    /// `step_until`: a far `max_time` takes the normal step, a near one lands
+    /// exactly on it, normal steps after it are unchanged, and the tet still
+    /// moves by v * t. Needs a GPU backend.
+    #[test]
+    fn step_until_lands_on_max_time() {
+        let mut ctx = CtsContext::new();
+        let mut time = 0.0;
+        assert!(matches!(ctx.step_until(1.0, Some(&mut time)), CtsStatus::BadState));
+        if ppf_cts_solver::linked_backend_name().is_none() {
+            eprintln!("skipped: no GPU backend linked");
+            return;
+        }
+        let params = CtsGlobalParams {
+            gravity: [0.0; 3],
+            air_density: 0.0,
+            air_friction: 0.0,
+            ..CtsGlobalParams::default()
+        };
+        assert!(matches!(ctx.set_params(&params), CtsStatus::Ok));
+        assert!(matches!(stage_tet(&mut ctx, &[solid(CtsModel::Arap)], None), CtsStatus::Ok));
+        let v = [1.0f32, 0.0, -0.5];
+        let vel: Vec<f32> = (0..4).flat_map(|_| v).collect();
+        assert!(matches!(ctx.set_velocities(&vel), CtsStatus::Ok));
+        assert!(matches!(ctx.initialize(), CtsStatus::Ok), "{}", last_error_text());
+        let dt = f64::from(ctx.normal_step.0);
+
+        assert!(matches!(ctx.step(Some(&mut time)), CtsStatus::Ok));
+        let first = time;
+        assert!((first - dt).abs() < 1e-9, "first step {first}, dt {dt}");
+        assert!(matches!(ctx.step_until(first + 10.0 * dt, Some(&mut time)), CtsStatus::Ok));
+        assert!((time - first - dt).abs() < 1e-9, "uncut step_until took {}", time - first);
+
+        let max_time = time + 0.37 * dt;
+        assert!(matches!(ctx.step_until(max_time, Some(&mut time)), CtsStatus::Ok), "{}", last_error_text());
+        assert_eq!(time, max_time);
+        assert!(matches!(ctx.step_until(max_time, Some(&mut time)), CtsStatus::BadArg));
+        assert!(matches!(ctx.step_until(f64::NAN, Some(&mut time)), CtsStatus::BadArg));
+
+        // Ends a hair (under 1/1000 step) past a full step: stretched onto it.
+        let max_time = time + 1.0005 * dt;
+        assert!(matches!(ctx.step_until(max_time, Some(&mut time)), CtsStatus::Ok));
+        assert_eq!(time, max_time);
+
+        let before = time;
+        assert!(matches!(ctx.step(Some(&mut time)), CtsStatus::Ok));
+        assert!((time - before - dt).abs() < 1e-9, "normal step after a cut took {}", time - before);
+
+        let mut out = [0.0f32; 12];
+        assert!(matches!(ctx.read_positions(&mut out), CtsStatus::Ok));
+        for i in 0..4 {
+            for a in 0..3 {
+                let moved = out[3 * i + a] - TET_VERTS[3 * i + a];
+                let expect = v[a] * time as f32;
+                assert!((moved - expect).abs() < 1e-3 + 0.02 * expect.abs(), "vertex {i} axis {a}: moved {moved}, expected {expect}");
+            }
+        }
+    }
+
     #[test]
     fn stitches_validate_and_settle_picks_the_step_dt() {
         let mut ctx = CtsContext::new();
@@ -1706,6 +1826,121 @@ mod tests {
         eprintln!("force field moved the sheet ({dx}, {dy}, {dz}) in {time:.3} s");
         assert!(dx > 0.005, "dx {dx}");
         assert!(dy.abs() < 0.2 * dx && dz.abs() < 0.2 * dx, "({dx}, {dy}, {dz})");
+    }
+
+    #[test]
+    fn plasticity_defaults_off_and_rejects_negative() {
+        let m = CtsMaterial::default();
+        assert_eq!(
+            [m.plasticity, m.plasticity_threshold, m.bend_plasticity, m.bend_plasticity_threshold],
+            [0.0; 4]
+        );
+        let bad = |f: fn(&mut CtsMaterial)| {
+            let mut m = solid(CtsModel::Arap);
+            f(&mut m);
+            m
+        };
+        for m in [
+            bad(|m| m.plasticity = -1.0),
+            bad(|m| m.plasticity_threshold = f32::NAN),
+            bad(|m| m.bend_plasticity = f32::INFINITY),
+            bad(|m| m.bend_plasticity_threshold = -0.1),
+        ] {
+            assert!(matches!(stage_tet(&mut CtsContext::new(), &[m], None), CtsStatus::BadArg));
+            assert!(last_error_text().contains("plasticity"));
+        }
+        let ok = CtsMaterial { plasticity: 0.5, plasticity_threshold: 0.5, ..solid(CtsModel::Arap) };
+        assert!(matches!(stage_tet(&mut CtsContext::new(), &[ok], None), CtsStatus::Ok));
+    }
+
+    /// A two-triangle shell, a rod and a tet, each with its own plastic row:
+    /// the values reach the face, hinge, rod-edge and tet params, and the
+    /// tet's rest shape creeps once it is squashed. Needs a GPU backend.
+    #[test]
+    fn plasticity_reaches_the_solver_and_creeps_the_tet() {
+        if ppf_cts_solver::linked_backend_name().is_none() {
+            eprintln!("skipped: no GPU backend linked");
+            return;
+        }
+        let mut ctx = CtsContext::new();
+        let params = CtsGlobalParams {
+            gravity: [0.0; 3],
+            air_density: 0.0,
+            air_friction: 0.0,
+            ..CtsGlobalParams::default()
+        };
+        assert!(matches!(ctx.set_params(&params), CtsStatus::Ok));
+        // Sheet 0..4 at y = 0.5, rod 4..7 at y = 1, tet 7..11 at the origin.
+        let mut verts = vec![
+            0.0f32, 0.5, 0.0, 0.1, 0.5, 0.0, 0.1, 0.5, 0.1, 0.0, 0.5, 0.1, //
+            0.0, 1.0, 0.0, 0.05, 1.0, 0.0, 0.1, 1.0, 0.0,
+        ];
+        verts.extend_from_slice(&TET_VERTS);
+        let tet_faces: Vec<u32> = TET_FACES.iter().map(|&v| v + 7).collect();
+        let mut faces = vec![0u32, 1, 2, 0, 2, 3];
+        faces.extend_from_slice(&tet_faces);
+        let tets: Vec<u32> = TET.iter().map(|&v| v + 7).collect();
+        let rods = [4u32, 5, 5, 6];
+        let shell = CtsMaterial {
+            plasticity: 1.0,
+            plasticity_threshold: 0.1,
+            bend_plasticity: 2.0,
+            bend_plasticity_threshold: 0.2,
+            ..CtsMaterial::default()
+        };
+        let rod = CtsMaterial {
+            contact_offset: 1e-3,
+            bend_plasticity: 3.0,
+            bend_plasticity_threshold: 0.3,
+            ..CtsMaterial::default()
+        };
+        let tet = CtsMaterial { plasticity: 100.0, plasticity_threshold: 0.0, ..solid(CtsModel::Arap) };
+        let face_idx = [0u32, 0, 2, 2, 2, 2];
+        let status = ctx.set_geometry_ex(
+            &verts, &faces, &tets, &rods, 2, &[shell, rod, tet],
+            Some(&face_idx), Some(&[2]), Some(&[1, 1]),
+        );
+        assert!(matches!(status, CtsStatus::Ok), "{}", last_error_text());
+        // Squash the tet: its apex flies down at 2 m/s.
+        let mut vel = vec![0.0f32; verts.len()];
+        vel[3 * 10 + 2] = -2.0;
+        assert!(matches!(ctx.set_velocities(&vel), CtsStatus::Ok));
+        assert!(matches!(ctx.initialize(), CtsStatus::Ok), "{}", last_error_text());
+
+        let ds = ctx.dataset.as_ref().unwrap();
+        let pa = &ds.param_arrays;
+        let face_param = |i: usize| pa.face.as_slice()[ds.prop.face.as_slice()[i].param_index as usize];
+        let f = face_param(0);
+        assert_eq!(
+            [f.plasticity, f.plasticity_threshold, f.bend_plasticity, f.bend_plasticity_threshold],
+            [1.0, 0.1, 2.0, 0.2]
+        );
+        // The sheet's one hinge takes its bend plasticity; the tet surface
+        // hinges take the tet row's (none).
+        let hinges: Vec<_> = ds.prop.hinge.as_slice().iter()
+            .map(|hp| pa.hinge.as_slice()[hp.param_index as usize])
+            .collect();
+        let plastic: Vec<_> = hinges.iter().filter(|h| h.plasticity > 0.0).collect();
+        assert_eq!(plastic.len(), 1, "{} hinges", hinges.len());
+        assert!((plastic[0].plasticity - 2.0).abs() < 1e-6);
+        assert!((plastic[0].plasticity_threshold - 0.2).abs() < 1e-6);
+        let e = pa.edge.as_slice()[ds.prop.edge.as_slice()[0].param_index as usize];
+        assert_eq!([e.plasticity, e.plasticity_threshold], [3.0, 0.3]);
+        let t = pa.tet.as_slice()[ds.prop.tet.as_slice()[0].param_index as usize];
+        assert_eq!([t.plasticity, t.plasticity_threshold], [100.0, 0.0]);
+        let rest0 = ds.inv_rest3x3.as_slice()[0];
+
+        let mut time = 0.0;
+        for _ in 0..30 {
+            assert!(matches!(ctx.step(Some(&mut time)), CtsStatus::Ok), "{}", last_error_text());
+        }
+        // The creep runs on the device; bring the rest matrices back first.
+        ppf_cts_solver::driver::fetch_inv_rest();
+        let rest1 = ctx.dataset.as_ref().unwrap().inv_rest3x3.as_slice()[0];
+        let creep = (rest1 - rest0).norm() / rest0.norm();
+        eprintln!("tet inverse rest matrix moved by {creep} (relative) in {time:.3} s");
+        // Without plasticity the pass never runs and the matrix is untouched.
+        assert!(creep > 1e-3, "creep {creep}");
     }
 
     #[test]

@@ -237,6 +237,10 @@ typedef struct CtsMaterial {
     float contact_gap;
     float contact_offset;
     float length_factor;
+    float plasticity;
+    float plasticity_threshold;
+    float bend_plasticity;
+    float bend_plasticity_threshold;
 } CtsMaterial;
 
 /**
@@ -362,7 +366,8 @@ enum CtsStatus ppf_cts_set_geometry(struct CtsContext *ctx,
  * Since ABI 11 every row's `model` must be a known `CtsModel` value, and
  * every row a tet uses must be a solid row: `model` ARAP, StVK or SNHk
  * (Baraff-Witkin is shell-only), `young_modulus > 0`,
- * `0 < poisson_ratio < 0.5` and `density > 0`. Otherwise this returns
+ * `0 < poisson_ratio < 0.5` and `density > 0`. Since ABI 17 every row's four
+ * plasticity values must be finite and `>= 0`. Otherwise this returns
  * `PPF_CTS_ERR_BAD_ARG` and [`ppf_cts_last_error`] names the row. Staging
  * geometry clears any velocities set by [`ppf_cts_set_velocities`].
  */
@@ -662,6 +667,17 @@ enum CtsStatus ppf_cts_initialize(struct CtsContext *ctx);
  * post-step simulation time.
  */
 enum CtsStatus ppf_cts_step(struct CtsContext *ctx, double *out_sim_time);
+
+/**
+ * Advance one solver step as [`ppf_cts_step`], but a step that would pass
+ * `max_time` (sim seconds), or stop short of it by under 1/1000 of a step,
+ * is cut to end exactly on it (the returned sim time equals `max_time`), so
+ * a caller can land each frame on its time. A step a contact shortens ends
+ * early as usual; call again. `max_time` must be finite and after the
+ * current sim time (else `BAD_ARG`). Settle window, inactive momentum and
+ * pin/gravity blending are as for [`ppf_cts_step`].
+ */
+enum CtsStatus ppf_cts_step_until(struct CtsContext *ctx, double max_time, double *out_sim_time);
 
 /**
  * Copy current surface vertex positions into `out` (`3*vertex_count`

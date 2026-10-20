@@ -282,8 +282,10 @@ pub fn build_props(
             offset: m.contact_offset,
             friction: m.friction,
             strainlimit: m.strainlimit,
-            plasticity: 0.0,
-            plasticity_threshold: 0.0,
+            // As scene.rs: a rod's `plasticity` is its bend plasticity (the
+            // rest angle of its interior joints creeps).
+            plasticity: m.bend_plasticity,
+            plasticity_threshold: m.bend_plasticity_threshold,
             bend_rest_from_geometry: false,
             deform_damping: 0.0,
             bend_damping: 0.0,
@@ -329,10 +331,12 @@ pub fn build_props(
                 shrink_x: 1.0,
                 shrink_y: 1.0,
                 pressure: 0.0,
-                plasticity: 0.0,
-                plasticity_threshold: 0.0,
-                bend_plasticity: 0.0,
-                bend_plasticity_threshold: 0.0,
+                // Hinges take bend plasticity area-averaged from these faces
+                // (builder::averaged_hinge_param). A rigid PDRD face has none.
+                plasticity: if pdrd { 0.0 } else { m.plasticity },
+                plasticity_threshold: if pdrd { 0.0 } else { m.plasticity_threshold },
+                bend_plasticity: if pdrd { 0.0 } else { m.bend_plasticity },
+                bend_plasticity_threshold: if pdrd { 0.0 } else { m.bend_plasticity_threshold },
                 bend_rest_from_geometry: false,
                 deform_damping: 0.0,
                 bend_damping: 0.0,
@@ -371,8 +375,8 @@ pub fn build_props(
                 mu: if pdrd { 0.0 } else { mu },
                 lambda: if pdrd { 0.0 } else { lambda },
                 shrink: 1.0,
-                plasticity: 0.0,
-                plasticity_threshold: 0.0,
+                plasticity: if pdrd { 0.0 } else { m.plasticity },
+                plasticity_threshold: if pdrd { 0.0 } else { m.plasticity_threshold },
                 deform_damping: 0.0,
             };
             let param_index = dedup(&mut tet_param_map, &mut tet_params, param);

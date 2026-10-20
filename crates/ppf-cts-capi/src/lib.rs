@@ -68,7 +68,13 @@ use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 /// 16: force fields: adds `CtsForceField`, `ppf_cts_add_force_field`,
 ///    `ppf_cts_set_force_field_weights` and `ppf_cts_clear_force_fields`.
 ///    Existing struct layouts are unchanged.
-const ABI_VERSION: u32 = 16;
+/// 17: `CtsMaterial` gains trailing `plasticity`, `plasticity_threshold`
+///    (stretch plasticity: shell faces and tets), `bend_plasticity` and
+///    `bend_plasticity_threshold` (shell hinges and rod joints), all default
+///    0 (off). `ppf_cts_set_geometry_ex` rejects a negative or non-finite
+///    value. Struct layout CHANGED. Also adds `ppf_cts_step_until` (one step
+///    cut to end exactly on a given sim time).
+const ABI_VERSION: u32 = 17;
 
 /// `CtsForceField.flags` bits (the solver's field header flags).
 pub const CTS_FIELD_USE_MIN: u32 = 1;
@@ -251,7 +257,8 @@ pub extern "C" fn ppf_cts_set_geometry(
 /// Since ABI 11 every row's `model` must be a known `CtsModel` value, and
 /// every row a tet uses must be a solid row: `model` ARAP, StVK or SNHk
 /// (Baraff-Witkin is shell-only), `young_modulus > 0`,
-/// `0 < poisson_ratio < 0.5` and `density > 0`. Otherwise this returns
+/// `0 < poisson_ratio < 0.5` and `density > 0`. Since ABI 17 every row's four
+/// plasticity values must be finite and `>= 0`. Otherwise this returns
 /// `PPF_CTS_ERR_BAD_ARG` and [`ppf_cts_last_error`] names the row. Staging
 /// geometry clears any velocities set by [`ppf_cts_set_velocities`].
 #[no_mangle]
@@ -865,6 +872,23 @@ pub extern "C" fn ppf_cts_step(ctx: *mut CtsContext, out_sim_time: *mut f64) -> 
             return CtsStatus::Null;
         };
         ctx.step(unsafe { out_sim_time.as_mut() })
+    })
+}
+
+/// Advance one solver step as [`ppf_cts_step`], but a step that would pass
+/// `max_time` (sim seconds), or stop short of it by under 1/1000 of a step,
+/// is cut to end exactly on it (the returned sim time equals `max_time`), so
+/// a caller can land each frame on its time. A step a contact shortens ends
+/// early as usual; call again. `max_time` must be finite and after the
+/// current sim time (else `BAD_ARG`). Settle window, inactive momentum and
+/// pin/gravity blending are as for [`ppf_cts_step`].
+#[no_mangle]
+pub extern "C" fn ppf_cts_step_until(ctx: *mut CtsContext, max_time: f64, out_sim_time: *mut f64) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        ctx.step_until(max_time, unsafe { out_sim_time.as_mut() })
     })
 }
 
