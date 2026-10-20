@@ -146,12 +146,17 @@ pub extern "C" fn ppf_cts_create() -> *mut CtsContext {
 }
 
 /// Destroy a context created by [`ppf_cts_create`]. Null is a no-op.
+/// Also frees the solver's device memory (it lives in process globals, one
+/// context per process); the next initialize reopens the device.
 #[no_mangle]
 pub extern "C" fn ppf_cts_destroy(ctx: *mut CtsContext) {
     if ctx.is_null() {
         return;
     }
     let _ = guard(|| {
+        // The driver's globals hold pointers into the context's DataSet and
+        // ParamSet, so they go first.
+        ppf_cts_solver::driver::release();
         // SAFETY: `ctx` came from `Box::into_raw` in `ppf_cts_create` and
         // is not used again after this call (caller contract).
         drop(unsafe { Box::from_raw(ctx) });

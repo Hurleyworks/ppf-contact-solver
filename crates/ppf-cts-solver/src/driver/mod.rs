@@ -246,6 +246,31 @@ fn clear_fatal() {
     FATAL_LATCHED.store(false, Ordering::SeqCst);
 }
 
+/// End the run and give its device memory back, for an embedder (the
+/// in-process C API) that tears a solve down and may start another one in the
+/// same process.
+///
+/// The solver state and the backend live in process globals, so dropping the
+/// caller's context alone leaves every arena allocated. This drops the state
+/// first, then the backend (whose close frees the arenas and the stream), the
+/// same order a run after a soft fault uses. The next `initialize()` reopens
+/// the device. The CUDA context itself is left alone: other code in the host
+/// process may share the device.
+pub fn release() {
+    if let Ok(mut slot) = SOLVER.lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = DEVICE.lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = SCENE.lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = INTERSECTION_RECORDS.lock() {
+        *slot = Vec::new();
+    }
+}
+
 /// The live scene, set by `initialize()`.
 ///
 /// The pointers inside `DataSet` are owned by the Rust caller in `backend.rs`

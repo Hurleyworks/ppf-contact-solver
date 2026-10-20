@@ -309,6 +309,8 @@ struct CtsContext *ppf_cts_create(void);
 
 /**
  * Destroy a context created by [`ppf_cts_create`]. Null is a no-op.
+ * Also frees the solver's device memory (it lives in process globals, one
+ * context per process); the next initialize reopens the device.
  */
 void ppf_cts_destroy(struct CtsContext *ctx);
 
