@@ -28,7 +28,7 @@ use crate::error::{set_last_error, CtsStatus};
 use crate::ingest;
 use crate::params::{
     CtsColliderMaterial, CtsFieldFalloff, CtsFieldShape, CtsFieldType, CtsFieldZDirection,
-    CtsForceField, CtsGlobalParams, CtsMaterial, CtsModel,
+    CtsForceField, CtsGlobalParams, CtsMaterial, CtsModel, CtsSandMaterial,
 };
 
 /// Geometry as staged by `set_geometry_ex`, in the caller's indexing. The
@@ -209,6 +209,13 @@ pub struct CtsContext {
     /// Threaded into `Props.sand` at `initialize`; grains are loose
     /// vertices (no incident element) in the staged geometry.
     sand: Option<builder::SandParams>,
+    /// Per-object SAND material table from `set_sand_ex`; empty after
+    /// `set_sand` (every grain then uses `sand`).
+    sand_materials: Vec<builder::SandParams>,
+    /// One `sand_materials` index per caller-staged vertex (caller order);
+    /// empty means every grain uses row 0. Remapped to the merged order at
+    /// `initialize`.
+    sand_vertex_material: Vec<u32>,
     /// PDRD (rigid-body) scene inputs, staged verbatim and handed to
     /// `builder::build` as a `PdrdSceneData` at `initialize`. Empty vecs
     /// mean "no PDRD bodies" and the build falls through to the parity
@@ -255,6 +262,8 @@ impl CtsContext {
             force_fields: Vec::new(),
             field_weight: Vec::new(),
             sand: None,
+            sand_materials: Vec::new(),
+            sand_vertex_material: Vec::new(),
             pdrd_body_rows: Vec::new(),
             pdrd_vert_index: Vec::new(),
             pdrd_vert_list: Vec::new(),
@@ -616,32 +625,90 @@ impl CtsContext {
         contact_gap: f32,
         friction: f32,
     ) -> CtsStatus {
-        if self.initialized {
-            set_last_error("set_sand called after initialize");
-            return CtsStatus::BadState;
-        }
-        if !(particle_mass > 0.0) {
-            set_last_error("set_sand: particle_mass must be positive");
-            return CtsStatus::BadArg;
-        }
-        if grain_radius < 0.0 {
-            set_last_error("set_sand: grain_radius must be non-negative");
-            return CtsStatus::BadArg;
-        }
-        if !(contact_gap > 0.0) {
-            set_last_error("set_sand: contact_gap must be positive");
-            return CtsStatus::BadArg;
-        }
-        if friction < 0.0 {
-            set_last_error("set_sand: friction must be non-negative");
-            return CtsStatus::BadArg;
-        }
-        self.sand = Some(builder::SandParams {
+        let one = CtsSandMaterial {
             particle_mass,
             grain_radius,
             contact_gap,
             friction,
-        });
+        };
+        self.stage_sand("set_sand", &[one], &[])
+    }
+
+    /// Stage per-object SAND materials: a table plus one index per
+    /// caller-staged vertex (read only for grains). Same per-row validation
+    /// as `set_sand`; the index length is checked against the staged vertex
+    /// count at `initialize`.
+    pub fn set_sand_ex(
+        &mut self,
+        materials: &[CtsSandMaterial],
+        material_index: &[u32],
+    ) -> CtsStatus {
+        self.stage_sand("set_sand_ex", materials, material_index)
+    }
+
+    fn stage_sand(
+        &mut self,
+        name: &str,
+        materials: &[CtsSandMaterial],
+        material_index: &[u32],
+    ) -> CtsStatus {
+        if self.initialized {
+            set_last_error(format!("{name} called after initialize"));
+            return CtsStatus::BadState;
+        }
+        if materials.is_empty() {
+            set_last_error(format!("{name}: no materials"));
+            return CtsStatus::BadArg;
+        }
+        if material_index.is_empty() && materials.len() != 1 {
+            set_last_error(format!(
+                "{name}: material_index is required when material_count > 1"
+            ));
+            return CtsStatus::BadArg;
+        }
+        for (k, m) in materials.iter().enumerate() {
+            let bad = if !(m.particle_mass > 0.0) || !m.particle_mass.is_finite() {
+                Some("particle_mass must be positive")
+            } else if !(m.grain_radius >= 0.0) || !m.grain_radius.is_finite() {
+                Some("grain_radius must be non-negative")
+            } else if !(m.contact_gap > 0.0) || !m.contact_gap.is_finite() {
+                Some("contact_gap must be positive")
+            } else if !(m.friction >= 0.0) || !m.friction.is_finite() {
+                Some("friction must be non-negative")
+            } else {
+                None
+            };
+            if let Some(why) = bad {
+                set_last_error(format!("{name}: material {k}: {why}"));
+                return CtsStatus::BadArg;
+            }
+        }
+        if let Some(i) = material_index
+            .iter()
+            .position(|&m| m as usize >= materials.len())
+        {
+            set_last_error(format!(
+                "{name}: material_index[{i}] >= material_count"
+            ));
+            return CtsStatus::BadArg;
+        }
+        let rows: Vec<builder::SandParams> = materials
+            .iter()
+            .map(|m| builder::SandParams {
+                particle_mass: m.particle_mass,
+                grain_radius: m.grain_radius,
+                contact_gap: m.contact_gap,
+                friction: m.friction,
+            })
+            .collect();
+        self.sand = Some(rows[0]);
+        if material_index.is_empty() {
+            self.sand_materials.clear();
+            self.sand_vertex_material.clear();
+        } else {
+            self.sand_materials = rows;
+            self.sand_vertex_material = material_index.to_vec();
+        }
         CtsStatus::Ok
     }
 
@@ -988,6 +1055,12 @@ impl CtsContext {
             set_last_error("set_rigidbodies: vert_index length != vertex count");
             return CtsStatus::BadArg;
         }
+        if !self.sand_vertex_material.is_empty()
+            && self.sand_vertex_material.len() != staged_vertex_count
+        {
+            set_last_error("set_sand_ex: vertex_count != staged vertex count");
+            return CtsStatus::BadArg;
+        }
         if self.pin_indices.iter().any(|&p| p as usize >= staged_vertex_count) {
             set_last_error("set_pins: pin index >= vertex count");
             return CtsStatus::BadArg;
@@ -1079,6 +1152,16 @@ impl CtsContext {
             w
         });
 
+        // Per-object SAND material index in the merged order; inserted
+        // animated-collider shell vertices are never grains and take 0.
+        let sand_vertex_material = (!self.sand_materials.is_empty()).then(|| {
+            let mut per_vertex = vec![0u32; merged.verts.len() / 3];
+            for (i, &m) in self.sand_vertex_material.iter().enumerate() {
+                per_vertex[merged.remap(i as u32) as usize] = m;
+            }
+            per_vertex
+        });
+
         let meshset = ingest::build_meshset(
             &merged.verts,
             &merged.faces,
@@ -1114,6 +1197,10 @@ impl CtsContext {
         );
         // Grain mass / contact params for the SAND pass in `build`.
         props.sand = self.sand;
+        if let Some(per_vertex) = sand_vertex_material {
+            props.sand_materials = self.sand_materials.clone();
+            props.sand_vertex_material = per_vertex;
+        }
         let constraint = self.build_constraint(&meshset.vertex, 0.0, 0.0);
 
         let pdrd = builder::PdrdSceneData {

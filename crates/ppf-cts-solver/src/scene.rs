@@ -2737,6 +2737,8 @@ impl Scene {
             face_params,
             tet_params,
             sand: self.sand_params(),
+            sand_materials: Vec::new(),
+            sand_vertex_material: Vec::new(),
             animated_materials: expand_face,
         }
     }

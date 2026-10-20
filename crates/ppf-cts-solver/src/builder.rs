@@ -25,6 +25,15 @@ pub struct Props {
     /// existing per-element param paths produce nothing for it). `None` for a
     /// scene with no SAND object, leaving every non-SAND path byte-identical.
     pub sand: Option<SandParams>,
+    /// Per-object SAND materials. Empty (the default) means every grain uses
+    /// `sand`. When non-empty, `sand_vertex_material` is indexed by the
+    /// global (merged) vertex index and names the entry of this table a grain
+    /// takes its mass / radius / gap / friction from; `sand` must then be
+    /// `Some` (any value) so the grain passes stay enabled.
+    pub sand_materials: Vec<SandParams>,
+    /// Per-vertex index into `sand_materials`, one entry per global vertex,
+    /// read only for grain vertices. Empty when `sand_materials` is empty.
+    pub sand_vertex_material: Vec<u32>,
     /// This scene animates at least one material, so every param table is
     /// built one entry per element with `param_index` fixed to the identity.
     ///
@@ -784,6 +793,32 @@ pub fn build(
     // below reads it without borrowing the `&mut props`. `None` for non-SAND
     // scenes, keeping every grain path inert there.
     let sand = props.sand;
+    // The SAND material of grain vertex `j`: its own per-object entry when a
+    // material table was staged, else the scene-wide `sand`.
+    let sand_materials = &props.sand_materials;
+    let sand_vertex_material = &props.sand_vertex_material;
+    let sand_at = |j: usize| -> Option<SandParams> {
+        sand.map(|default| {
+            if sand_materials.is_empty() {
+                default
+            } else {
+                sand_materials[sand_vertex_material[j] as usize]
+            }
+        })
+    };
+    if sand.is_some() && !sand_materials.is_empty() {
+        assert_eq!(
+            sand_vertex_material.len(),
+            n_vert,
+            "SAND per-vertex material index must cover every vertex"
+        );
+        assert!(
+            sand_vertex_material
+                .iter()
+                .all(|&m| (m as usize) < sand_materials.len()),
+            "SAND per-vertex material index out of range"
+        );
+    }
 
     // Build vertex props and params
     let mut vertex_prop = vec![VertexProp::default(); n_vert];
@@ -1089,9 +1124,10 @@ pub fn build(
                 .iter()
                 .all(|&ei| ei >= rod_count)
     };
-    if let Some(sand) = sand {
+    if sand.is_some() {
         for j in 0..n_vert {
             if is_grain(j) {
+                let sand = sand_at(j).unwrap();
                 vertex_prop[j].mass += sand.particle_mass;
                 assert_gt!(
                     vertex_prop[j].mass,
@@ -1164,10 +1200,10 @@ pub fn build(
     let grain_grot_vec = vec![Vec3f::new(0.0, 0.0, 0.0); n_vert];
     let mut grain_inv_inertia_vec = vec![0.0f32; n_vert];
     let mut grain_inv_inertia_center_vec = vec![0.0f32; n_vert];
-    if let Some(sand) = sand {
-        let r = sand.grain_radius;
+    if sand.is_some() {
         for j in 0..n_vert {
             if is_grain(j) {
+                let r = sand_at(j).unwrap().grain_radius;
                 // I_eff = I_center + m r^2 = (2/5 + 1) m r^2 = (7/5) m r^2.
                 let inertia = 1.4 * vertex_prop[j].mass * r * r;
                 if inertia > 0.0 {
@@ -1206,7 +1242,7 @@ pub fn build(
 
             if let Some(vparam) = derived {
                 Some(vparam)
-            } else if let Some(sand) = sand.filter(|_| is_grain(j)) {
+            } else if let Some(sand) = sand_at(j).filter(|_| is_grain(j)) {
                 // A SAND grain has no incident element so weight_sum == 0, but
                 // it still needs a contact VertexParam: the dedup below then
                 // assigns it a valid param_index (without this it stays 0,

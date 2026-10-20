@@ -273,6 +273,19 @@ pub struct CtsColliderMaterial {
     pub friction: f32,
 }
 
+/// One SAND material row for `ppf_cts_set_sand_ex` (one Sand object's
+/// grains). Same units and rules as the `ppf_cts_set_sand` scalars:
+/// `particle_mass > 0` (kg per grain), `grain_radius >= 0` (contact sphere
+/// radius), `contact_gap > 0` (barrier gap), `friction >= 0`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CtsSandMaterial {
+    pub particle_mass: f32,
+    pub grain_radius: f32,
+    pub contact_gap: f32,
+    pub friction: f32,
+}
+
 /// Force-field type. The values are the solver's `force_field::FieldType`;
 /// the types the C API does not take (magnetic, texture, fluid) are absent.
 #[repr(u32)]

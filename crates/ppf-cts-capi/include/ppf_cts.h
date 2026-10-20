@@ -267,6 +267,19 @@ typedef struct CtsForceField {
     uint32_t seed;
 } CtsForceField;
 
+/**
+ * One SAND material row for `ppf_cts_set_sand_ex` (one Sand object's
+ * grains). Same units and rules as the `ppf_cts_set_sand` scalars:
+ * `particle_mass > 0` (kg per grain), `grain_radius >= 0` (contact sphere
+ * radius), `contact_gap > 0` (barrier gap), `friction >= 0`.
+ */
+typedef struct CtsSandMaterial {
+    float particle_mass;
+    float grain_radius;
+    float contact_gap;
+    float friction;
+} CtsSandMaterial;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -628,6 +641,30 @@ enum CtsStatus ppf_cts_set_sand(struct CtsContext *ctx,
                                 float grain_radius,
                                 float contact_gap,
                                 float friction);
+
+/**
+ * Stage SAND granular materials per object. `materials` holds
+ * `material_count` (>= 1) rows; `material_index` holds `vertex_count`
+ * entries, one per vertex staged via [`ppf_cts_set_geometry`] (same order),
+ * each `< material_count`. Only grain vertices (no incident face/rod/tet)
+ * read their entry; give every other vertex 0. `vertex_count` must equal the
+ * staged vertex count (checked at [`ppf_cts_initialize`]). `material_index`
+ * may be null with `vertex_count == 0` only when `material_count == 1`
+ * (every grain takes row 0, the same as [`ppf_cts_set_sand`]).
+ *
+ * Every value is per grain, so two grains of different materials meet as
+ * the solver's per-vertex contact does: they repel below center distance
+ * `radius_a + radius_b`, the barrier gap is `(gap_a + gap_b) / 2`, friction
+ * is combined by `CtsGlobalParams` friction mode (min by default), and each
+ * grain keeps its own mass and rolling inertia. Replaces any earlier
+ * `ppf_cts_set_sand` / `ppf_cts_set_sand_ex`. Before
+ * [`ppf_cts_initialize`] only.
+ */
+enum CtsStatus ppf_cts_set_sand_ex(struct CtsContext *ctx,
+                                   const struct CtsSandMaterial *materials,
+                                   uint32_t material_count,
+                                   const uint32_t *material_index,
+                                   uint32_t vertex_count);
 
 /**
  * Stage PDRD (position-based rigid-body) inputs. The caller precomputes

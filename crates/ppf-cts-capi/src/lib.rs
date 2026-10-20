@@ -23,7 +23,9 @@ use std::ffi::c_char;
 
 use context::CtsContext;
 use error::{guard, guard_value, last_error_ptr, CtsStatus};
-use params::{CtsColliderMaterial, CtsForceField, CtsGlobalParams, CtsMaterial, CtsModel};
+use params::{
+    CtsColliderMaterial, CtsForceField, CtsGlobalParams, CtsMaterial, CtsModel, CtsSandMaterial,
+};
 use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 
 /// Bumped whenever the C ABI (struct layouts or function signatures)
@@ -74,7 +76,11 @@ use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 ///    0 (off). `ppf_cts_set_geometry_ex` rejects a negative or non-finite
 ///    value. Struct layout CHANGED. Also adds `ppf_cts_step_until` (one step
 ///    cut to end exactly on a given sim time).
-const ABI_VERSION: u32 = 17;
+/// 18: adds `CtsSandMaterial` and `ppf_cts_set_sand_ex` (per-object SAND
+///    materials: a material table plus one material index per staged
+///    vertex). `ppf_cts_set_sand` is unchanged (one material for every
+///    grain). Existing struct layouts are unchanged.
+const ABI_VERSION: u32 = 18;
 
 /// `CtsForceField.flags` bits (the solver's field header flags).
 pub const CTS_FIELD_USE_MIN: u32 = 1;
@@ -810,6 +816,50 @@ pub extern "C" fn ppf_cts_set_sand(
             return CtsStatus::Null;
         };
         ctx.set_sand(particle_mass, grain_radius, contact_gap, friction)
+    })
+}
+
+/// Stage SAND granular materials per object. `materials` holds
+/// `material_count` (>= 1) rows; `material_index` holds `vertex_count`
+/// entries, one per vertex staged via [`ppf_cts_set_geometry`] (same order),
+/// each `< material_count`. Only grain vertices (no incident face/rod/tet)
+/// read their entry; give every other vertex 0. `vertex_count` must equal the
+/// staged vertex count (checked at [`ppf_cts_initialize`]). `material_index`
+/// may be null with `vertex_count == 0` only when `material_count == 1`
+/// (every grain takes row 0, the same as [`ppf_cts_set_sand`]).
+///
+/// Every value is per grain, so two grains of different materials meet as
+/// the solver's per-vertex contact does: they repel below center distance
+/// `radius_a + radius_b`, the barrier gap is `(gap_a + gap_b) / 2`, friction
+/// is combined by `CtsGlobalParams` friction mode (min by default), and each
+/// grain keeps its own mass and rolling inertia. Replaces any earlier
+/// `ppf_cts_set_sand` / `ppf_cts_set_sand_ex`. Before
+/// [`ppf_cts_initialize`] only.
+#[no_mangle]
+pub extern "C" fn ppf_cts_set_sand_ex(
+    ctx: *mut CtsContext,
+    materials: *const CtsSandMaterial,
+    material_count: u32,
+    material_index: *const u32,
+    vertex_count: u32,
+) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        if materials.is_null() || material_count == 0 {
+            return CtsStatus::Null;
+        }
+        if material_index.is_null() && vertex_count != 0 {
+            return CtsStatus::Null;
+        }
+        let materials = unsafe { std::slice::from_raw_parts(materials, material_count as usize) };
+        let material_index: &[u32] = if vertex_count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(material_index, vertex_count as usize) }
+        };
+        ctx.set_sand_ex(materials, material_index)
     })
 }
 

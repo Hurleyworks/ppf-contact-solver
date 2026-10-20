@@ -398,6 +398,8 @@ pub fn build_props(
         face_params,
         tet_params,
         sand: None,
+        sand_materials: Vec::new(),
+        sand_vertex_material: Vec::new(),
         animated_materials: false,
     };
 
