@@ -80,7 +80,12 @@ use ppf_cts_solver::data::PDRD_BODY_ROW_LEN;
 ///    materials: a material table plus one material index per staged
 ///    vertex). `ppf_cts_set_sand` is unchanged (one material for every
 ///    grain). Existing struct layouts are unchanged.
-const ABI_VERSION: u32 = 18;
+/// 19: adds `ppf_cts_set_rigid_vertex_masses` (one mass per rigid-body vertex,
+///    in `set_rigidbodies` `vert_list` order, replacing the rows' uniform
+///    `mass_per_vertex` in the vertex mass pass, so a body's centre of mass and
+///    inertia follow its mass distribution). Existing struct layouts and
+///    signatures are unchanged.
+const ABI_VERSION: u32 = 19;
 
 /// `CtsForceField.flags` bits (the solver's field header flags).
 pub const CTS_FIELD_USE_MIN: u32 = 1;
@@ -903,6 +908,35 @@ pub extern "C" fn ppf_cts_set_rigidbodies(
         let vert_list = unsafe { slice_u32(vert_list, vert_list_count as usize) };
         let rest_centered = unsafe { slice_f32(rest_centered, rest_centered_count as usize) };
         ctx.set_rigidbodies(body_rows, vert_index, vert_list, rest_centered)
+    })
+}
+
+/// Stage one mass per rigid-body vertex, `count` floats in the same order as
+/// [`ppf_cts_set_rigidbodies`]' `vert_list` (`count` must equal its
+/// `vert_list_count`; every mass finite and > 0). These replace the rows'
+/// uniform `mass_per_vertex` as the vertices' masses; the solve applies
+/// inertia and gravity per vertex, so the body's centre of mass and inertia
+/// follow them. The row's `mass_per_vertex` should then be the masses' mean,
+/// and its `rest_gram_inv` the inverse of `sum_k m_k ybar_k ybar_k^T / mean`,
+/// so the preconditioner's analytic inertia matches. `centroid` and
+/// `rest_centered` stay the plain vertex average (the per-step fit centres
+/// on it). Null/0 reverts to the uniform masses. Call after
+/// `ppf_cts_set_rigidbodies` (which clears them) and before initialize.
+#[no_mangle]
+pub extern "C" fn ppf_cts_set_rigid_vertex_masses(
+    ctx: *mut CtsContext,
+    masses: *const f32,
+    count: u32,
+) -> CtsStatus {
+    guard(|| {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return CtsStatus::Null;
+        };
+        if masses.is_null() && count != 0 {
+            return CtsStatus::Null;
+        }
+        let masses = unsafe { slice_f32(masses, count as usize) };
+        ctx.set_rigid_vertex_masses(masses)
     })
 }
 

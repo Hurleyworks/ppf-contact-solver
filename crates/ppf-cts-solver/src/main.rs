@@ -366,6 +366,7 @@ fn main() {
             vert_index: scene.pdrd_vert_index(),
             vert_list: scene.pdrd_vert_list(),
             rest_centered: scene.pdrd_rest_centered(),
+            vertex_mass: &[],
         };
         let lock_data = builder::LockSceneData {
             translation_axes: scene.translation_locks(),

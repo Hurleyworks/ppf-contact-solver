@@ -696,6 +696,23 @@ enum CtsStatus ppf_cts_set_rigidbodies(struct CtsContext *ctx,
                                        uint32_t rest_centered_count);
 
 /**
+ * Stage one mass per rigid-body vertex, `count` floats in the same order as
+ * [`ppf_cts_set_rigidbodies`]' `vert_list` (`count` must equal its
+ * `vert_list_count`; every mass finite and > 0). These replace the rows'
+ * uniform `mass_per_vertex` as the vertices' masses; the solve applies
+ * inertia and gravity per vertex, so the body's centre of mass and inertia
+ * follow them. The row's `mass_per_vertex` should then be the masses' mean,
+ * and its `rest_gram_inv` the inverse of `sum_k m_k ybar_k ybar_k^T / mean`,
+ * so the preconditioner's analytic inertia matches. `centroid` and
+ * `rest_centered` stay the plain vertex average (the per-step fit centres
+ * on it). Null/0 reverts to the uniform masses. Call after
+ * `ppf_cts_set_rigidbodies` (which clears them) and before initialize.
+ */
+enum CtsStatus ppf_cts_set_rigid_vertex_masses(struct CtsContext *ctx,
+                                               const float *masses,
+                                               uint32_t count);
+
+/**
  * Allocate GPU state and initialize the backend. Geometry/params/pins
  * must be staged first.
  */

@@ -228,6 +228,9 @@ pub struct CtsContext {
     pdrd_vert_index: Vec<u32>,
     pdrd_vert_list: Vec<u32>,
     pdrd_rest_centered: Vec<f32>,
+    /// One mass per `pdrd_vert_list` entry from `set_rigid_vertex_masses`;
+    /// empty means every body vertex takes its row's `mass_per_vertex`.
+    pdrd_vertex_mass: Vec<f32>,
     backend: Option<Backend>,
     dataset: Option<DataSet>,
     param: Option<ParamSet>,
@@ -268,6 +271,7 @@ impl CtsContext {
             pdrd_vert_index: Vec::new(),
             pdrd_vert_list: Vec::new(),
             pdrd_rest_centered: Vec::new(),
+            pdrd_vertex_mass: Vec::new(),
             backend: None,
             dataset: None,
             param: None,
@@ -744,6 +748,28 @@ impl CtsContext {
         self.pdrd_vert_index = vert_index.to_vec();
         self.pdrd_vert_list = vert_list.to_vec();
         self.pdrd_rest_centered = rest_centered.to_vec();
+        // New bodies invalidate masses staged for the old vertex list.
+        self.pdrd_vertex_mass.clear();
+        CtsStatus::Ok
+    }
+
+    /// Stage one mass per `pdrd_vert_list` entry (same order), replacing the
+    /// rows' uniform `mass_per_vertex` in the vertex mass pass. Must follow
+    /// `set_rigidbodies`; an empty slice reverts to the uniform masses.
+    pub fn set_rigid_vertex_masses(&mut self, masses: &[f32]) -> CtsStatus {
+        if self.initialized {
+            set_last_error("set_rigid_vertex_masses called after initialize");
+            return CtsStatus::BadState;
+        }
+        if !masses.is_empty() && masses.len() != self.pdrd_vert_list.len() {
+            set_last_error("set_rigid_vertex_masses: count != set_rigidbodies vert_list count");
+            return CtsStatus::BadArg;
+        }
+        if masses.iter().any(|m| !m.is_finite() || *m <= 0.0) {
+            set_last_error("set_rigid_vertex_masses: every mass must be finite and > 0");
+            return CtsStatus::BadArg;
+        }
+        self.pdrd_vertex_mass = masses.to_vec();
         CtsStatus::Ok
     }
 
@@ -1208,6 +1234,7 @@ impl CtsContext {
             vert_index: &self.pdrd_vert_index,
             vert_list: &self.pdrd_vert_list,
             rest_centered: &self.pdrd_rest_centered,
+            vertex_mass: &self.pdrd_vertex_mass,
         };
         // No aggregate locks: one displacement group, both axes zero (a zero
         // axis under the default modes disables the lock), every vertex in it.

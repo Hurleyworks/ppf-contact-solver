@@ -505,11 +505,19 @@ fn clamp_substep_dt(dt: f32, fps: f64) -> f32 {
 /// `rest_centered` is 3 f32 per entry of `vert_list`, same length
 /// (3 * vert_list.len()): the PDRD vertex's centered rest position
 /// `ȳₘ = x̄ₘ − c̄_body`.
+///
+/// `vertex_mass` is one f32 per entry of `vert_list`: that body vertex's own
+/// mass. Empty means every vertex of a body takes the row's uniform
+/// `mass_per_vertex`. The reduced solve's operator applies inertia and
+/// gravity per vertex, so non-uniform masses move the body's centre of mass
+/// and inertia without any change to the rows' geometric centring; the row's
+/// `mass_per_vertex` then only feeds the preconditioner's analytic inertia.
 pub struct PdrdSceneData<'a> {
     pub body_rows: &'a [f32],
     pub vert_index: &'a [u32],
     pub vert_list: &'a [u32],
     pub rest_centered: &'a [f32],
+    pub vertex_mass: &'a [f32],
 }
 
 /// Cosserat rod inputs threaded from `Scene`: `edge` marks the rod edges
@@ -592,6 +600,45 @@ fn lock_component_enabled(
         return true;
     }
     axis != Vec3f::zeros()
+}
+
+/// Add each PDRD body vertex's mass into `vertex_prop` (see the call site in
+/// `build`). Split out so the per-vertex mass path can be tested alone.
+fn add_pdrd_vertex_masses(vertex_prop: &mut [VertexProp], pdrd: &PdrdSceneData<'_>) {
+    if !pdrd.body_rows.is_empty() {
+        assert!(
+            pdrd.body_rows.len() % PDRD_BODY_ROW_LEN == 0,
+            "PDRD body_rows length {} not a multiple of {} in mass pass",
+            pdrd.body_rows.len(),
+            PDRD_BODY_ROW_LEN,
+        );
+        assert!(
+            pdrd.vertex_mass.is_empty() || pdrd.vertex_mass.len() == pdrd.vert_list.len(),
+            "PDRD vertex_mass length {} != vert_list length {}",
+            pdrd.vertex_mass.len(),
+            pdrd.vert_list.len(),
+        );
+        assert!(
+            pdrd.vertex_mass.iter().all(|m| m.is_finite() && *m > 0.0),
+            "PDRD vertex_mass holds a non-positive or non-finite mass",
+        );
+        let n_bodies = pdrd.body_rows.len() / PDRD_BODY_ROW_LEN;
+        for b in 0..n_bodies {
+            let row = &pdrd.body_rows[PDRD_BODY_ROW_LEN * b..PDRD_BODY_ROW_LEN * (b + 1)];
+            let vertex_start = row[0] as usize;
+            let vertex_count = row[1] as usize;
+            let mass_per_vertex = row[15];
+            for k in vertex_start..(vertex_start + vertex_count) {
+                let vidx = pdrd.vert_list[k] as usize;
+                let mass = if pdrd.vertex_mass.is_empty() {
+                    mass_per_vertex
+                } else {
+                    pdrd.vertex_mass[k]
+                };
+                vertex_prop[vidx].mass += mass;
+            }
+        }
+    }
 }
 
 pub fn build(
@@ -1080,31 +1127,14 @@ pub fn build(
         vertex_prop[j].volume += volume;
     }
 
-    // PDRD bodies use a uniform per-vertex mass `mass_per_vertex`
-    // chosen so the body's effective rotational inertia matches the
+    // PDRD bodies use a per-vertex mass: `pdrd.vertex_mass` when the
+    // caller supplied one, else the row's uniform `mass_per_vertex`, either
+    // way scaled so the body's effective rotational inertia matches the
     // volumetric I_solid (trace-ratio scaling computed at scene
     // build). Scene.rs already zeros face_prop.mass on PDRD faces so
     // the face-mass aggregation above contributes nothing for these
-    // vertices; this loop adds the correct mass on top.
-    if !pdrd.body_rows.is_empty() {
-        assert!(
-            pdrd.body_rows.len() % PDRD_BODY_ROW_LEN == 0,
-            "PDRD body_rows length {} not a multiple of {} in mass pass",
-            pdrd.body_rows.len(),
-            PDRD_BODY_ROW_LEN,
-        );
-        let n_bodies = pdrd.body_rows.len() / PDRD_BODY_ROW_LEN;
-        for b in 0..n_bodies {
-            let row = &pdrd.body_rows[PDRD_BODY_ROW_LEN * b..PDRD_BODY_ROW_LEN * (b + 1)];
-            let vertex_start = row[0] as usize;
-            let vertex_count = row[1] as usize;
-            let mass_per_vertex = row[15];
-            for k in vertex_start..(vertex_start + vertex_count) {
-                let vidx = pdrd.vert_list[k] as usize;
-                vertex_prop[vidx].mass += mass_per_vertex;
-            }
-        }
-    }
+    // vertices; this pass adds the correct mass on top.
+    add_pdrd_vertex_masses(&mut vertex_prop, &pdrd);
 
     // A grain is a loose vertex with no incident element (no face, no
     // rod-edge, no tet); the face/rod/tet/PDRD mass aggregation above
@@ -3195,5 +3225,100 @@ mod start_link_tests {
     #[should_panic(expected = "past the")]
     fn a_link_past_both_pools_is_refused() {
         start_link_table(&[0, 9], 2, 2);
+    }
+}
+
+#[cfg(test)]
+mod pdrd_mass_tests {
+    use super::*;
+
+    /// A unit cube whose top face is an 8x8 grid and every other face one
+    /// quad, each face with its own vertices. Returns positions and triangles.
+    fn cube_dense_on_top() -> (Vec<[f32; 3]>, Vec<[usize; 3]>) {
+        let mut points = Vec::new();
+        let mut tris = Vec::new();
+        // (origin, u edge, v edge, cells) per face.
+        let faces: [([f32; 3], [f32; 3], [f32; 3], usize); 6] = [
+            ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 8),
+            ([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0], 1),
+            ([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1),
+            ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 1),
+            ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0], 1),
+            ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], 1),
+        ];
+        for (o, u, v, n) in faces {
+            let base = points.len();
+            for j in 0..=n {
+                for i in 0..=n {
+                    let (a, b) = (i as f32 / n as f32, j as f32 / n as f32);
+                    points.push([
+                        o[0] + a * u[0] + b * v[0],
+                        o[1] + a * u[1] + b * v[1],
+                        o[2] + a * u[2] + b * v[2],
+                    ]);
+                }
+            }
+            for j in 0..n {
+                for i in 0..n {
+                    let p = base + j * (n + 1) + i;
+                    tris.push([p, p + 1, p + n + 2]);
+                    tris.push([p, p + n + 2, p + n + 1]);
+                }
+            }
+        }
+        (points, tris)
+    }
+
+    fn mass_centroid(vertex_prop: &[VertexProp], points: &[[f32; 3]]) -> [f32; 3] {
+        let mut c = [0.0f32; 3];
+        let mut total = 0.0f32;
+        for (vp, p) in vertex_prop.iter().zip(points) {
+            total += vp.mass;
+            for a in 0..3 {
+                c[a] += vp.mass * p[a];
+            }
+        }
+        c.map(|x| x / total)
+    }
+
+    // Area-share masses keep a body with dense vertices on one side balanced
+    // about its volume centroid; the uniform row mass does not.
+    #[test]
+    fn area_weighted_vertex_masses_keep_the_centroid_at_the_volume_centre() {
+        let (points, tris) = cube_dense_on_top();
+        let n = points.len();
+        let mut area_mass = vec![0.0f32; n];
+        for t in &tris {
+            let [a, b, c] = t.map(|i| Vec3f::from(points[i]));
+            let third = (b - a).cross(&(c - a)).norm() / 6.0;
+            for &i in t {
+                area_mass[i] += third;
+            }
+        }
+        let mut row = vec![0.0f32; PDRD_BODY_ROW_LEN];
+        row[1] = n as f32;
+        row[2] = 1.0;
+        row[15] = 1.0;
+        let vert_list: Vec<u32> = (0..n as u32).collect();
+        let vert_index = vec![1u32; n];
+        let rest_centered = vec![0.0f32; 3 * n];
+        let run = |vertex_mass: &[f32]| {
+            let mut vertex_prop = vec![VertexProp::default(); n];
+            let pdrd = PdrdSceneData {
+                body_rows: &row,
+                vert_index: &vert_index,
+                vert_list: &vert_list,
+                rest_centered: &rest_centered,
+                vertex_mass,
+            };
+            add_pdrd_vertex_masses(&mut vertex_prop, &pdrd);
+            mass_centroid(&vertex_prop, &points)
+        };
+        let weighted = run(&area_mass);
+        let uniform = run(&[]);
+        for a in 0..3 {
+            assert!((weighted[a] - 0.5).abs() < 1e-4, "weighted centroid {weighted:?}");
+        }
+        assert!(uniform[2] > 0.7, "uniform centroid {uniform:?} should lean to the dense face");
     }
 }
